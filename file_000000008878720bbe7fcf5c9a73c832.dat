@@ -1,0 +1,575 @@
+
+# ============================================================
+# FULL MONGE–AMPÈRE NOCN
+# Complete standalone training + generation script
+# ============================================================
+
+import random
+from collections import defaultdict
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+class Config:
+    text_path = "singlekb.txt"
+    seed = 42
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    seq_len = 4
+    batch_size = 256
+    epochs = 8
+    lr = 2e-3
+    weight_decay = 1e-5
+
+    d_model = 96
+    d_coef = 32
+    d_obj = 96
+    d_mem = 96
+
+    mem_slots = 256
+    temp_step = 0.08
+
+    lambda_transport = 0.10
+    lambda_contrastive = 0.20
+    lambda_mem = 0.10
+
+
+# ============================================================
+# UTILS
+# ============================================================
+
+def set_seed(seed):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def tokenize(text):
+    text = text.lower()
+    out = []
+    cur = []
+    for ch in text:
+        if ch.isalnum() or ch == "'":
+            cur.append(ch)
+        else:
+            if cur:
+                out.append("".join(cur))
+                cur = []
+    if cur:
+        out.append("".join(cur))
+    return out
+
+
+def build_vocab(tokens):
+    vocab = ["<pad>", "<unk>", "<bos>", "<eos>"] + sorted(set(tokens))
+    stoi = {t: i for i, t in enumerate(vocab)}
+    itos = {i: t for t, i in stoi.items()}
+    return vocab, stoi, itos
+
+
+# ============================================================
+# DATASET
+# ============================================================
+
+class TextWindowDataset(Dataset):
+    def __init__(self, ids, seq_len):
+        self.samples = [
+            ids[i:i + seq_len]
+            for i in range(len(ids) - seq_len)
+        ]
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        s = self.samples[idx]
+        x = torch.tensor(s[:-1], dtype=torch.long)
+        y = torch.tensor(s[-1], dtype=torch.long)
+        return x, y
+
+
+# ============================================================
+# MEMORY GRAPH
+# ============================================================
+
+class DynamicMemoryGraph:
+    def __init__(self, slots, dim, device):
+        self.device = device
+        self.node = torch.zeros(slots, dim, device=device)
+        self.ptr = 0
+        self.token_to_slot = {}
+
+    def update(self, token_ids, feats):
+        with torch.no_grad():
+            for tid, feat in zip(token_ids.tolist(), feats):
+                if tid not in self.token_to_slot:
+                    self.token_to_slot[tid] = self.ptr
+                    self.ptr = (self.ptr + 1) % self.node.size(0)
+
+                slot = self.token_to_slot[tid]
+                self.node[slot] = (
+                    0.95 * self.node[slot]
+                    + 0.05 * feat
+                )
+
+    def read(self, token_ids):
+        out = []
+        for tid in token_ids.tolist():
+            if tid in self.token_to_slot:
+                out.append(
+                    self.node[self.token_to_slot[tid]]
+                )
+            else:
+                out.append(
+                    torch.zeros(
+                        self.node.size(1),
+                        device=self.device
+                    )
+                )
+        return torch.stack(out)
+
+
+# ============================================================
+# MONGE–AMPERE TRANSPORT
+# ============================================================
+
+class TransportPotential(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(d, d),
+            nn.SiLU(),
+            nn.Linear(d, d),
+            nn.SiLU(),
+            nn.Linear(d, 1)
+        )
+
+    def forward(self, x):
+        x = x.requires_grad_(True)
+
+        phi = self.net(x).sum()
+
+        grad = torch.autograd.grad(
+            phi,
+            x,
+            create_graph=True,
+            retain_graph=True
+        )[0]
+
+        return grad
+
+
+# ============================================================
+# MODEL
+# ============================================================
+
+class MongeAmpereNOCN(nn.Module):
+
+    def __init__(self, vocab_size, cfg):
+        super().__init__()
+
+        self.cfg = cfg
+
+        self.word_emb = nn.Embedding(
+            vocab_size,
+            cfg.d_model
+        )
+
+        self.pos_emb = nn.Embedding(
+            cfg.seq_len - 1,
+            cfg.d_model
+        )
+
+        self.coeff_encoder = nn.Sequential(
+            nn.Linear(cfg.d_model, cfg.d_coef),
+            nn.Tanh(),
+            nn.Linear(cfg.d_coef, cfg.d_coef)
+        )
+
+        self.temporal_ode = nn.Sequential(
+            nn.Linear(
+                cfg.d_model + cfg.d_coef,
+                cfg.d_obj
+            ),
+            nn.SiLU(),
+            nn.Linear(cfg.d_obj, cfg.d_obj)
+        )
+
+        self.transport = TransportPotential(
+            cfg.d_obj
+        )
+
+        self.mem_project = nn.Linear(
+            cfg.d_mem,
+            cfg.d_obj
+        )
+
+        self.decoder = nn.Sequential(
+            nn.Linear(
+                cfg.d_obj * 2,
+                cfg.d_obj
+            ),
+            nn.GELU(),
+            nn.Linear(
+                cfg.d_obj,
+                vocab_size
+            )
+        )
+
+        self.contrast_proj = nn.Linear(
+            cfg.d_obj,
+            cfg.d_obj
+        )
+
+    def encode_context(self, x):
+
+        pos = torch.arange(
+            x.size(1),
+            device=x.device
+        )
+
+        h = (
+            self.word_emb(x)
+            + self.pos_emb(pos)[None]
+        )
+
+        h = h.mean(dim=1)
+
+        c = self.coeff_encoder(h)
+
+        return h, c
+
+    def temporal_dynamics(self, h, c):
+
+        z = torch.cat([h, c], dim=-1)
+
+        dz = self.temporal_ode(z)
+
+        return h + self.cfg.temp_step * dz
+
+    def forward(self, x, memory_read):
+
+        h, c = self.encode_context(x)
+
+        obj_state = self.temporal_dynamics(
+            h,
+            c
+        )
+
+        transported = self.transport(
+            obj_state
+        )
+
+        mem = self.mem_project(
+            memory_read
+        )
+
+        fused = torch.cat(
+            [transported, mem],
+            dim=-1
+        )
+
+        logits = self.decoder(fused)
+
+        return {
+            "logits": logits,
+            "transported": transported,
+            "obj_state": obj_state,
+            "h": h
+        }
+
+    def loss_fn(
+        self,
+        out,
+        y,
+        token_ids,
+        memory_graph
+    ):
+
+        recon_loss = F.cross_entropy(
+            out["logits"],
+            y
+        )
+
+        density = torch.softmax(
+            out["transported"].norm(dim=-1),
+            dim=0
+        )
+
+        target = (
+            torch.ones_like(density)
+            / density.numel()
+        )
+
+        transport_loss = F.mse_loss(
+            density,
+            target
+        )
+
+        z = F.normalize(
+            self.contrast_proj(
+                out["transported"]
+            ),
+            dim=-1
+        )
+
+        sim = z @ z.t()
+
+        eye = torch.eye(
+            sim.size(0),
+            device=sim.device
+        )
+
+        contrastive_loss = (
+            (sim - eye) ** 2
+        ).mean()
+
+        mem_read = memory_graph.read(
+            token_ids
+        )
+
+        mem_loss = F.mse_loss(
+            mem_read,
+            out["h"].detach()
+        )
+
+        total = (
+            recon_loss
+            + self.cfg.lambda_transport
+            * transport_loss
+            + self.cfg.lambda_contrastive
+            * contrastive_loss
+            + self.cfg.lambda_mem
+            * mem_loss
+        )
+
+        return total
+
+
+# ============================================================
+# GENERATION
+# ============================================================
+
+@torch.no_grad()
+def generate(
+    model,
+    memory,
+    stoi,
+    itos,
+    prompt,
+    max_new_tokens=40
+):
+
+    model.eval()
+
+    toks = tokenize(prompt)
+
+    ids = [
+        stoi.get(t, stoi["<unk>"])
+        for t in toks
+    ]
+
+    while len(ids) < 3:
+        ids.insert(0, stoi["<bos>"])
+
+    out_words = toks[:]
+
+    for _ in range(max_new_tokens):
+
+        x = torch.tensor(
+            [ids[-3:]],
+            device=next(
+                model.parameters()
+            ).device
+        )
+
+        mem = memory.read(
+            x[0]
+        ).mean(0)
+
+        res = model(x, mem.unsqueeze(0))
+
+        probs = F.softmax(
+            res["logits"][0],
+            dim=-1
+        )
+
+        nxt = torch.multinomial(
+            probs,
+            1
+        ).item()
+
+        out_words.append(
+            itos.get(nxt, "<unk>")
+        )
+
+        ids.append(nxt)
+
+    return " ".join(out_words)
+
+
+# ============================================================
+# TRAIN
+# ============================================================
+
+def train():
+
+    cfg = Config()
+
+    set_seed(cfg.seed)
+
+    device = torch.device(
+        cfg.device
+    )
+
+    text = open(
+        cfg.text_path,
+        "r",
+        encoding="utf-8"
+    ).read()
+
+    toks = tokenize(text)
+
+    vocab, stoi, itos = build_vocab(toks)
+
+    ids = (
+        [stoi["<bos>"]]
+        + [stoi.get(t, stoi["<unk>"]) for t in toks]
+        + [stoi["<eos>"]]
+    )
+
+    ds = TextWindowDataset(
+        ids,
+        cfg.seq_len
+    )
+
+    dl = DataLoader(
+        ds,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        drop_last=True
+    )
+
+    model = MongeAmpereNOCN(
+        len(vocab),
+        cfg
+    ).to(device)
+
+    memory = DynamicMemoryGraph(
+        cfg.mem_slots,
+        cfg.d_mem,
+        device
+    )
+
+    opt = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay
+    )
+
+    for epoch in range(cfg.epochs):
+
+        model.train()
+
+        running = 0.0
+
+        for x, y in dl:
+
+            x = x.to(device)
+            y = y.to(device)
+
+            mem = memory.read(
+                x[:, -1]
+            )
+
+            out = model(x, mem)
+
+            loss = model.loss_fn(
+                out,
+                y,
+                x[:, -1],
+                memory
+            )
+
+            opt.zero_grad()
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                1.0
+            )
+
+            opt.step()
+
+            memory.update(
+                x[:, -1],
+                out["h"].detach()
+            )
+
+            running += loss.item()
+
+        print(
+            f"epoch {epoch+1}/{cfg.epochs} "
+            f"loss={running/len(dl):.4f}"
+        )
+
+        print(
+            generate(
+                model,
+                memory,
+                stoi,
+                itos,
+                "the car",
+                20
+            )
+        )
+
+    return (
+        model,
+        memory,
+        stoi,
+        itos
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+
+    model, memory, stoi, itos = train()
+
+    while True:
+        try:
+            prompt = input("USER: ").strip()
+
+            if not prompt:
+                continue
+
+            print(
+                generate(
+                    model,
+                    memory,
+                    stoi,
+                    itos,
+                    prompt,
+                    60
+                )
+            )
+
+            print()
+
+        except (
+            KeyboardInterrupt,
+            EOFError
+        ):
+            break

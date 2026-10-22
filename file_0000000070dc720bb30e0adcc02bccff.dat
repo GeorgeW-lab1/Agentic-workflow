@@ -1,0 +1,193 @@
+
+# t_structure_frequency_model.py
+#
+# Frequency-driven T-Structure prototype
+# State = (signature, trigram_frequency, signature_frequency)
+# Weight = X * (Y ** alpha)
+
+import argparse
+import random
+from collections import defaultdict, Counter
+
+import numpy as np
+from nltk import pos_tag
+from nltk.tokenize import word_tokenize
+
+
+def signature(tri):
+    return tuple(tag for _, tag in pos_tag(list(tri)))
+
+
+def trigrams(tokens):
+    return [tuple(tokens[i:i+3]) for i in range(len(tokens)-2)]
+
+
+class FrequencyTStructure:
+
+    def __init__(self, alpha=2.0):
+        self.alpha = alpha
+        self.signature_freq = Counter()
+        self.trigram_freq = Counter()
+        self.structure = defaultdict(list)
+
+    def fit(self, text):
+
+        toks = word_tokenize(text.lower())
+        tris = trigrams(toks)
+
+        for tri in tris:
+            sig = signature(tri)
+            self.signature_freq[sig] += 1
+            self.trigram_freq[tri] += 1
+
+        for tri, x in self.trigram_freq.items():
+            sig = signature(tri)
+            y = self.signature_freq[sig]
+
+            self.structure[sig].append({
+                "trigram": tri,
+                "x_freq": x,
+                "y_freq": y,
+                "weight": x * (y ** self.alpha)
+            })
+
+    def nearest_signature(self, sig):
+
+        if sig in self.structure:
+            return sig
+
+        best = None
+        best_overlap = -1
+
+        for cand in self.structure.keys():
+            overlap = sum(a == b for a, b in zip(sig, cand))
+
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best = cand
+
+        return best
+
+    def sample_trigram(self, sig, recent=None):
+
+        sig = self.nearest_signature(sig)
+
+        if sig is None:
+            return None
+
+        items = self.structure[sig]
+
+        weights = []
+
+        for item in items:
+
+            w = item["weight"]
+
+            if recent and item["trigram"] in recent:
+                w *= 0.25
+
+            weights.append(w)
+
+        idx = random.choices(
+            range(len(items)),
+            weights=weights,
+            k=1
+        )[0]
+
+        return items[idx]["trigram"]
+
+    def generate(self, seed_text, steps=100):
+
+        words = seed_text.lower().split()
+
+        if len(words) < 3:
+            raise ValueError("Need at least 3 words.")
+
+        recent = []
+
+        for _ in range(steps):
+
+            tri = tuple(words[-3:])
+            sig = signature(tri)
+
+            chosen = self.sample_trigram(
+                sig,
+                recent=recent[-20:]
+            )
+
+            if chosen is None:
+                break
+
+            words.append(chosen[-1])
+
+            recent.append(chosen)
+
+        return " ".join(words)
+
+
+def read_text(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def main():
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--corpus",
+        required=True
+    )
+
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=2.0
+    )
+
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=150
+    )
+
+    args = parser.parse_args()
+
+    text = read_text(args.corpus)
+
+    model = FrequencyTStructure(
+        alpha=args.alpha
+    )
+
+    print("Building frequency T-structure...")
+    model.fit(text)
+
+    print(
+        f"signatures={len(model.signature_freq)} "
+        f"trigrams={len(model.trigram_freq)}"
+    )
+
+    while True:
+
+        seed = input(
+            "\nseed text (q=quit): "
+        ).strip()
+
+        if seed.lower() == "q":
+            break
+
+        try:
+
+            out = model.generate(
+                seed,
+                steps=args.steps
+            )
+
+            print("\n" + out)
+
+        except Exception as e:
+            print("error:", e)
+
+
+if __name__ == "__main__":
+    main()

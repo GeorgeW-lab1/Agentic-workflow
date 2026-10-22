@@ -1,0 +1,73 @@
+"""
+active_memory.py -- ACTIVE MEMORY node of the diagram.
+
+This is the shared, mutable state that every other component reads from or
+writes into: the growing filament's token buffer, its recorded growth
+trace, and the tension bias derived from the corpus. The diagram shows
+active memory as the hub with bidirectional edges to UVG's, UTG's, and
+optimizer/validator, and a one-way edge *from* the kernel -- the kernel
+initializes/drives it, but doesn't own the read/write traffic the other
+components generate.
+
+Nothing in this file transforms data (that's syntactic_algebra.py) or
+generates new nodes (that's uli.py). It only stores and hands out state.
+"""
+
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional
+import torch
+
+
+@dataclass
+class FilamentGrowthStep:
+    """One ring added to the growing filament -- a single slot of active
+    memory, populated as extrusion happens and read back out by UTG's
+    (for rendering) and optimizer/validator (for curvature analysis)."""
+    step_index: int
+    anchor_nodes: List[Tuple[str, str, str]]
+    warp_mode: str
+    candidate_extensions: List[Tuple[Tuple[str, str, str], float]]
+    chosen_node: Tuple[str, str, str]
+    chosen_prob: float
+    selection_method: str = "sampled"
+    runner_up_gap: Optional[float] = None
+    lookahead_depth: int = 0
+    lookahead_scores: Optional[List[Tuple[Tuple[str, str, str], float]]] = None
+    overrode_greedy: bool = False
+    curvature: Optional[float] = None
+    curvature_is_flat: Optional[bool] = None
+    curvature_ratio: Optional[float] = None
+    close_to_previous: Optional[bool] = None
+
+
+class ActiveMemory:
+    """
+    The live state of one filament under growth: its token buffer
+    (`shadow_idx`), its tension bias, and the trace of steps recorded so
+    far. UVG's, UTG's, and optimizer/validator all read and write through
+    this object rather than passing raw tensors around.
+    """
+
+    def __init__(self, seed_anchor_idx: torch.Tensor, tension_bias: torch.Tensor):
+        self.shadow_idx: torch.Tensor = seed_anchor_idx.clone()
+        self.tension_bias: torch.Tensor = tension_bias.to(seed_anchor_idx.device)
+        self.trace: List[FilamentGrowthStep] = []
+        self.words: List[Tuple[str, str, str]] = []
+
+    def append_node(self, next_id: torch.Tensor, chosen_node, chosen_prob: float):
+        """Extends the buffer with a newly extruded node."""
+        self.shadow_idx = torch.cat([self.shadow_idx, next_id], dim=1)
+        self.words.append(chosen_node)
+
+    def record_step(self, step: FilamentGrowthStep):
+        self.trace.append(step)
+
+    def anchor(self, anchor_size: int) -> torch.Tensor:
+        """Right-aligned view of the current buffer, padded to anchor_size.
+        This is the piece of active memory UVG's/UTG's/ULI's most often
+        ask for."""
+        cond = self.shadow_idx[:, -anchor_size:]
+        if cond.shape[1] < anchor_size:
+            pad = cond[:, :1].repeat(1, anchor_size - cond.shape[1])
+            cond = torch.cat([pad, cond], dim=1)
+        return cond

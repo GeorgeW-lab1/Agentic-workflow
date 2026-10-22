@@ -1,0 +1,1706 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import random
+import re
+from collections import Counter, defaultdict
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+SPECIAL = ["<pad>", "<unk>"]
+
+
+# ============================================================
+# TOKENIZATION
+# ============================================================
+
+def tokenize(text: str) -> list[str]:
+    return re.findall(
+        r"[A-Za-z0-9_']+|[.,!?;:]",
+        text.lower(),
+    )
+
+
+def detokenize(tokens: list[str]) -> str:
+    text = " ".join(tokens)
+
+    text = re.sub(
+        r"\s+([.,!?;:])",
+        r"\1",
+        text,
+    )
+
+    text = re.sub(
+        r"\s+'\s*",
+        "'",
+        text,
+    )
+
+    return text.strip()
+
+
+# ============================================================
+# PROMPT BUILDER
+# ============================================================
+
+def build_prompt(task: str) -> str:
+    task = " ".join(task.split()).strip()
+
+    if not task:
+        raise ValueError(
+            "The task description cannot be empty."
+        )
+
+    return (
+        "You are a precise and capable assistant.\n\n"
+        "Task:\n"
+        f"{task}\n\n"
+        "Instructions:\n"
+        "- Understand the task before responding.\n"
+        "- State important assumptions when necessary.\n"
+        "- Give a direct and useful answer.\n"
+        "- Use clear structure and appropriate detail.\n"
+        "- Do not invent facts or results.\n"
+    )
+
+
+# ============================================================
+# VOCABULARY
+# ============================================================
+
+def build_vocab(
+    tokens: list[str],
+    max_vocab: int,
+):
+    if max_vocab < len(SPECIAL):
+        raise ValueError(
+            f"--max-vocab must be at least {len(SPECIAL)}"
+        )
+
+    counts = Counter(tokens)
+
+    ordinary_limit = max_vocab - len(SPECIAL)
+
+    ordinary_words = [
+        word
+        for word, _ in counts.most_common()
+        if word not in SPECIAL
+    ][:ordinary_limit]
+
+    words = SPECIAL + ordinary_words
+
+    word_to_idx = {
+        word: index
+        for index, word in enumerate(words)
+    }
+
+    idx_to_word = {
+        index: word
+        for index, word in enumerate(words)
+    }
+
+    unk_id = word_to_idx["<unk>"]
+
+    ids = [
+        word_to_idx.get(token, unk_id)
+        for token in tokens
+    ]
+
+    return (
+        words,
+        word_to_idx,
+        idx_to_word,
+        ids,
+    )
+
+
+# ============================================================
+# TRIGRAM STATISTICS
+# ============================================================
+
+def build_trigram_statistics(ids: list[int]):
+    trigram_counts = Counter()
+    context_counts = Counter()
+    continuation_counts = defaultdict(Counter)
+
+    for i in range(len(ids) - 2):
+        a, b, c = ids[i:i + 3]
+
+        trigram_counts[(a, b, c)] += 1
+        context_counts[(a, b)] += 1
+        continuation_counts[(a, b)][c] += 1
+
+    return (
+        trigram_counts,
+        context_counts,
+        continuation_counts,
+    )
+
+
+def build_examples(
+    continuation_counts,
+    candidate_k: int,
+):
+    if candidate_k < 1:
+        raise ValueError(
+            "--candidate-k must be greater than zero"
+        )
+
+    global_counts = Counter()
+
+    for counter in continuation_counts.values():
+        global_counts.update(counter)
+
+    global_candidates = [
+        token
+        for token, _ in global_counts.most_common()
+    ]
+
+    examples = []
+
+    for context, counter in continuation_counts.items():
+        ordered = sorted(
+            counter.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+
+        candidates = [
+            token
+            for token, _ in ordered[:candidate_k]
+        ]
+
+        if len(candidates) < candidate_k:
+            for token in global_candidates:
+                if token not in candidates:
+                    candidates.append(token)
+
+                if len(candidates) >= candidate_k:
+                    break
+
+        if not candidates:
+            continue
+
+        counts = torch.tensor(
+            [
+                counter.get(token, 0)
+                for token in candidates
+            ],
+            dtype=torch.float32,
+        )
+
+        total = counts.sum()
+
+        if total <= 0:
+            continue
+
+        probs = counts / total
+
+        footprint = sum(
+            math.comb(int(count.item()), 2)
+            for count in counts
+            if count.item() >= 2
+        )
+
+        entropy = float(
+            -(
+                probs
+                * probs.clamp_min(1e-12).log()
+            ).sum()
+        )
+
+        examples.append(
+            {
+                "context": context,
+                "candidates": candidates,
+                "counts": counts,
+                "probs": probs,
+                "footprint": footprint,
+                "entropy": entropy,
+                "effective_support": math.exp(entropy),
+                "support": int((counts > 0).sum()),
+            }
+        )
+
+    return examples
+
+
+# ============================================================
+# DATASET GEOMETRY
+# ============================================================
+
+def build_geometry(
+    vocab_size: int,
+    trigram_counts,
+):
+    frequency = torch.ones(
+        vocab_size,
+        dtype=torch.float32,
+    )
+
+    for (_, _, continuation), count in trigram_counts.items():
+        frequency[continuation] += float(count)
+
+    log_frequency = frequency.log()
+
+    rho = log_frequency - log_frequency.min()
+    rho_max = rho.max()
+
+    if rho_max > 0:
+        rho = rho / rho_max
+    else:
+        rho = torch.zeros_like(rho)
+
+    theta = 2.0 * math.pi * rho
+    sigma = 1.0 - rho
+
+    normalized_frequency = (
+        frequency
+        / frequency.max().clamp_min(1e-8)
+    )
+
+    return torch.stack(
+        [
+            rho,
+            theta / math.pi,
+            sigma,
+            normalized_frequency,
+        ],
+        dim=-1,
+    )
+
+
+# ============================================================
+# SUM + DIAG NETWORK
+# ============================================================
+
+class SumDiagNetwork(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        geometry: torch.Tensor,
+        embed_dim: int = 96,
+        hidden_dim: int = 192,
+    ):
+        super().__init__()
+
+        self.vocab_size = vocab_size
+
+        self.register_buffer(
+            "geometry",
+            geometry,
+        )
+
+        self.embedding = nn.Embedding(
+            vocab_size,
+            embed_dim,
+        )
+
+        self.geometry_encoder = nn.Sequential(
+            nn.Linear(4, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+
+        self.context_network = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+        )
+
+        self.output = nn.Linear(
+            hidden_dim,
+            vocab_size,
+        )
+
+        self.sigma_network = nn.Sequential(
+            nn.Linear(4, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
+        )
+
+        self.theta_network = nn.Sequential(
+            nn.Linear(4, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
+        )
+
+        self.rho_network = nn.Sequential(
+            nn.Linear(4, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
+        )
+
+        self.raw_syn_strength = nn.Parameter(
+            torch.tensor(0.0)
+        )
+
+        self.raw_geometry_strength = nn.Parameter(
+            torch.tensor(0.0)
+        )
+
+        self.raw_temperature = nn.Parameter(
+            torch.tensor(0.0)
+        )
+
+        self.register_buffer(
+            "W",
+            self._build_relation_matrix(geometry),
+        )
+
+    @property
+    def syn_strength(self):
+        return F.softplus(
+            self.raw_syn_strength
+        )
+
+    @property
+    def geometry_strength(self):
+        return F.softplus(
+            self.raw_geometry_strength
+        )
+
+    @property
+    def temperature(self):
+        return (
+            F.softplus(self.raw_temperature)
+            + 1e-4
+        )
+
+    @staticmethod
+    def diag(x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 1:
+            return torch.diag(x)
+
+        if x.ndim == 2:
+            return torch.diag_embed(x)
+
+        raise RuntimeError(
+            "DIAG expects [K] or [B, K], "
+            f"received {tuple(x.shape)}"
+        )
+
+    @staticmethod
+    def _build_relation_matrix(
+        geometry: torch.Tensor,
+    ) -> torch.Tensor:
+        rho = geometry[:, 0]
+        theta = geometry[:, 1] * math.pi
+        sigma = geometry[:, 2]
+
+        delta_rho = (
+            rho[:, None] - rho[None, :]
+        )
+
+        delta_theta = (
+            theta[:, None] - theta[None, :]
+        )
+
+        delta_sigma = (
+            sigma[:, None] - sigma[None, :]
+        )
+
+        relation = (
+            torch.exp(-8.0 * delta_rho.square())
+            * 0.5
+            * (1.0 + torch.cos(delta_theta))
+            * torch.exp(-8.0 * delta_sigma.square())
+        )
+
+        relation.fill_diagonal_(0.0)
+
+        relation = relation / relation.sum(
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(1e-8)
+
+        return relation
+
+    def forward(
+        self,
+        context: torch.Tensor,
+        candidates: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        context:
+            [B, 2]
+
+        candidates:
+            [B, K]
+
+        returns:
+            [B, K]
+        """
+
+        if context.ndim != 2:
+            raise ValueError(
+                "context must have shape [B, 2], got "
+                f"{tuple(context.shape)}"
+            )
+
+        if context.shape[1] != 2:
+            raise ValueError(
+                "context must contain exactly two token IDs"
+            )
+
+        if candidates.ndim != 2:
+            raise ValueError(
+                "candidates must have shape [B, K], got "
+                f"{tuple(candidates.shape)}"
+            )
+
+        if candidates.shape[1] == 0:
+            raise ValueError(
+                "candidates must contain at least one token"
+            )
+
+        if context.shape[0] != candidates.shape[0]:
+            raise ValueError(
+                "context and candidates must have "
+                "the same batch size"
+            )
+
+        _, candidate_count = candidates.shape
+
+        # ----------------------------------------------------
+        # SUM: context embeddings
+        # ----------------------------------------------------
+
+        context_embedding = self.embedding(context)
+        context_sum = context_embedding.sum(dim=1)
+
+        # ----------------------------------------------------
+        # SUM: context geometry
+        # ----------------------------------------------------
+
+        context_geometry = self.geometry[context]
+
+        geometry_embedding = self.geometry_encoder(
+            context_geometry
+        )
+
+        geometry_sum = geometry_embedding.sum(dim=1)
+
+        h = context_sum + geometry_sum
+        h = self.context_network(h)
+
+        # ----------------------------------------------------
+        # Candidate logits
+        # ----------------------------------------------------
+
+        full_logits = self.output(h)
+
+        z = torch.gather(
+            full_logits,
+            dim=1,
+            index=candidates,
+        )
+
+        # ----------------------------------------------------
+        # Relational candidate mixing
+        # ----------------------------------------------------
+
+        relation_rows = self.W[candidates]
+
+        relation_indices = candidates.unsqueeze(1).expand(
+            -1,
+            candidate_count,
+            -1,
+        )
+
+        relation_weights = torch.gather(
+            relation_rows,
+            dim=2,
+            index=relation_indices,
+        )
+
+        relational = torch.bmm(
+            relation_weights,
+            z.unsqueeze(-1),
+        ).squeeze(-1)
+
+        # ----------------------------------------------------
+        # Geometric candidate relation
+        # ----------------------------------------------------
+
+        context_g = self.geometry[context].mean(dim=1)
+        candidate_g = self.geometry[candidates]
+
+        delta_rho = (
+            candidate_g[..., 0]
+            - context_g[:, None, 0]
+        )
+
+        delta_theta = (
+            candidate_g[..., 1]
+            - context_g[:, None, 1]
+        ) * math.pi
+
+        delta_sigma = (
+            candidate_g[..., 2]
+            - context_g[:, None, 2]
+        )
+
+        geometric_relation = (
+            torch.exp(-8.0 * delta_rho.square())
+            * 0.5
+            * (1.0 + torch.cos(delta_theta))
+            * torch.exp(-8.0 * delta_sigma.square())
+        )
+
+        # ----------------------------------------------------
+        # SUM
+        # ----------------------------------------------------
+
+        z = (
+            z
+            + self.syn_strength * relational
+            + self.geometry_strength
+            * geometric_relation
+        )
+
+        # ----------------------------------------------------
+        # DIAG sigma
+        # ----------------------------------------------------
+
+        sigma = (
+            0.5
+            + 0.5
+            * torch.sigmoid(
+                self.sigma_network(candidate_g)
+                .squeeze(-1)
+            )
+        )
+
+        z = torch.bmm(
+            self.diag(sigma),
+            z.unsqueeze(-1),
+        ).squeeze(-1)
+
+        # ----------------------------------------------------
+        # DIAG theta
+        # ----------------------------------------------------
+
+        theta = (
+            0.5
+            + 0.5
+            * torch.sigmoid(
+                self.theta_network(candidate_g)
+                .squeeze(-1)
+            )
+        )
+
+        z = torch.bmm(
+            self.diag(theta),
+            z.unsqueeze(-1),
+        ).squeeze(-1)
+
+        # ----------------------------------------------------
+        # ReLU geometric gate
+        # ----------------------------------------------------
+
+        orientation = 0.5 * (
+            1.0
+            + torch.cos(
+                candidate_g[..., 1] * math.pi
+            )
+        )
+
+        center = orientation.mean(
+            dim=1,
+            keepdim=True,
+        )
+
+        relu_gate = F.relu(
+            orientation - center
+        )
+
+        relu_gate = relu_gate / relu_gate.amax(
+            dim=1,
+            keepdim=True,
+        ).clamp_min(1e-8)
+
+        z = (
+            relu_gate * z
+            + (1.0 - relu_gate) * F.relu(z)
+        )
+
+        # ----------------------------------------------------
+        # DIAG rho
+        # ----------------------------------------------------
+
+        rho = (
+            0.5
+            + F.softplus(
+                self.rho_network(candidate_g)
+                .squeeze(-1)
+            )
+        )
+
+        z = torch.bmm(
+            self.diag(rho),
+            z.unsqueeze(-1),
+        ).squeeze(-1)
+
+        # ----------------------------------------------------
+        # Nonlinear amplitude
+        # ----------------------------------------------------
+
+        z = (
+            z.sign()
+            * z.abs().clamp(max=30.0).pow(2.0)
+        )
+
+        return z / self.temperature
+
+
+# ============================================================
+# METRICS
+# ============================================================
+
+def distribution_metrics(
+    target: torch.Tensor,
+    predicted: torch.Tensor,
+    counts: torch.Tensor,
+):
+    eps = torch.finfo(target.dtype).eps
+
+    target = target.clamp_min(eps)
+    target = target / target.sum(
+        dim=-1,
+        keepdim=True,
+    )
+
+    predicted = predicted.clamp_min(eps)
+    predicted = predicted / predicted.sum(
+        dim=-1,
+        keepdim=True,
+    )
+
+    kl = (
+        target
+        * (target.log() - predicted.log())
+    ).sum(dim=-1)
+
+    midpoint = 0.5 * (
+        target + predicted
+    )
+
+    js = 0.5 * (
+        target
+        * (target.log() - midpoint.log())
+    ).sum(dim=-1)
+
+    js += 0.5 * (
+        predicted
+        * (predicted.log() - midpoint.log())
+    ).sum(dim=-1)
+
+    target_entropy = -(
+        target * target.log()
+    ).sum(dim=-1)
+
+    predicted_entropy = -(
+        predicted * predicted.log()
+    ).sum(dim=-1)
+
+    target_support = torch.exp(
+        target_entropy.clamp(max=20.0)
+    )
+
+    predicted_support = torch.exp(
+        predicted_entropy.clamp(max=20.0)
+    )
+
+    sample_count = counts.sum(
+        dim=-1
+    ).clamp_min(1.0)
+
+    pair_total = (
+        sample_count
+        * (sample_count - 1.0)
+        * 0.5
+    )
+
+    target_footprint = (
+        pair_total
+        * target.square().sum(dim=-1)
+    )
+
+    predicted_footprint = (
+        pair_total
+        * predicted.square().sum(dim=-1)
+    )
+
+    target_sorted, _ = torch.sort(
+        target,
+        dim=-1,
+        descending=True,
+    )
+
+    predicted_sorted, _ = torch.sort(
+        predicted,
+        dim=-1,
+        descending=True,
+    )
+
+    spectrum_loss = (
+        target_sorted - predicted_sorted
+    ).square().mean(dim=-1)
+
+    target_cdf = torch.cumsum(
+        target_sorted,
+        dim=-1,
+    )
+
+    predicted_cdf = torch.cumsum(
+        predicted_sorted,
+        dim=-1,
+    )
+
+    cdf_loss = (
+        target_cdf - predicted_cdf
+    ).square().mean(dim=-1)
+
+    entropy_loss = (
+        target_entropy - predicted_entropy
+    ).square()
+
+    footprint_loss = (
+        torch.log1p(target_footprint)
+        - torch.log1p(predicted_footprint)
+    ).square()
+
+    support_loss = (
+        torch.log(target_support)
+        - torch.log(predicted_support)
+    ).square()
+
+    return {
+        "kl": kl,
+        "js": js,
+        "target_entropy": target_entropy,
+        "predicted_entropy": predicted_entropy,
+        "target_support": target_support,
+        "predicted_support": predicted_support,
+        "target_footprint": target_footprint,
+        "predicted_footprint": predicted_footprint,
+        "spectrum_loss": spectrum_loss,
+        "cdf_loss": cdf_loss,
+        "entropy_loss": entropy_loss,
+        "footprint_loss": footprint_loss,
+        "support_loss": support_loss,
+    }
+
+
+def neural_loss(metrics):
+    return (
+        1.00 * metrics["kl"].mean()
+        + 0.50 * metrics["js"].mean()
+        + 0.50 * metrics["entropy_loss"].mean()
+        + 0.75 * metrics["footprint_loss"].mean()
+        + 0.50 * metrics["support_loss"].mean()
+        + 0.50 * metrics["spectrum_loss"].mean()
+        + 0.50 * metrics["cdf_loss"].mean()
+    )
+
+
+# ============================================================
+# TRAINING
+# ============================================================
+
+def train(
+    model: SumDiagNetwork,
+    examples: list[dict],
+    epochs: int,
+    learning_rate: float,
+):
+    if not examples:
+        raise ValueError(
+            "Cannot train with an empty example set"
+        )
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=1e-4,
+    )
+
+    history = defaultdict(list)
+
+    for epoch in range(epochs):
+        model.train()
+
+        order = list(range(len(examples)))
+        random.shuffle(order)
+
+        sums = defaultdict(float)
+
+        for index in order:
+            example = examples[index]
+
+            context = torch.tensor(
+                [example["context"]],
+                dtype=torch.long,
+                device=DEVICE,
+            )
+
+            candidates = torch.tensor(
+                [example["candidates"]],
+                dtype=torch.long,
+                device=DEVICE,
+            )
+
+            target = example["probs"].to(
+                DEVICE
+            ).unsqueeze(0)
+
+            counts = example["counts"].to(
+                DEVICE
+            ).unsqueeze(0)
+
+            logits = model(
+                context,
+                candidates,
+            )
+
+            predicted = F.softmax(
+                logits,
+                dim=-1,
+            )
+
+            metrics = distribution_metrics(
+                target,
+                predicted,
+                counts,
+            )
+
+            loss = neural_loss(metrics)
+
+            optimizer.zero_grad(
+                set_to_none=True
+            )
+
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=1.0,
+            )
+
+            optimizer.step()
+
+            sums["loss"] += float(
+                loss.detach()
+            )
+
+            sums["kl"] += float(
+                metrics["kl"].mean().detach()
+            )
+
+            sums["js"] += float(
+                metrics["js"].mean().detach()
+            )
+
+            sums["entropy"] += float(
+                metrics["entropy_loss"]
+                .mean()
+                .detach()
+            )
+
+            sums["footprint_loss"] += float(
+                metrics["footprint_loss"]
+                .mean()
+                .detach()
+            )
+
+            sums["support_loss"] += float(
+                metrics["support_loss"]
+                .mean()
+                .detach()
+            )
+
+            sums["spectrum_loss"] += float(
+                metrics["spectrum_loss"]
+                .mean()
+                .detach()
+            )
+
+            sums["cdf_loss"] += float(
+                metrics["cdf_loss"]
+                .mean()
+                .detach()
+            )
+
+            sums["data_footprint"] += float(
+                metrics["target_footprint"]
+                .mean()
+                .detach()
+            )
+
+            sums["neural_footprint"] += float(
+                metrics["predicted_footprint"]
+                .mean()
+                .detach()
+            )
+
+            sums["data_entropy"] += float(
+                metrics["target_entropy"]
+                .mean()
+                .detach()
+            )
+
+            sums["neural_entropy"] += float(
+                metrics["predicted_entropy"]
+                .mean()
+                .detach()
+            )
+
+            sums["data_support"] += float(
+                metrics["target_support"]
+                .mean()
+                .detach()
+            )
+
+            sums["neural_support"] += float(
+                metrics["predicted_support"]
+                .mean()
+                .detach()
+            )
+
+        count = max(len(examples), 1)
+
+        for key, value in sums.items():
+            history[key].append(value / count)
+
+        history["temperature"].append(
+            float(
+                model.temperature.detach().cpu()
+            )
+        )
+
+        history["syn_strength"].append(
+            float(
+                model.syn_strength.detach().cpu()
+            )
+        )
+
+        history["geometry_strength"].append(
+            float(
+                model.geometry_strength
+                .detach()
+                .cpu()
+            )
+        )
+
+        print(
+            f"epoch {epoch + 1:03d} | "
+            f"loss={history['loss'][-1]:.6f} | "
+            f"KL={history['kl'][-1]:.6f} | "
+            f"JS={history['js'][-1]:.6f} | "
+            f"H_data={history['data_entropy'][-1]:.4f} | "
+            f"H_net={history['neural_entropy'][-1]:.4f} | "
+            f"F_data={history['data_footprint'][-1]:.4f} | "
+            f"F_net={history['neural_footprint'][-1]:.4f} | "
+            f"T={history['temperature'][-1]:.4f}"
+        )
+
+    return dict(history)
+
+
+# ============================================================
+# EVALUATION
+# ============================================================
+
+@torch.no_grad()
+def evaluate(
+    model: SumDiagNetwork,
+    examples: list[dict],
+):
+    model.eval()
+
+    rows = []
+
+    for example in examples:
+        context = torch.tensor(
+            [example["context"]],
+            dtype=torch.long,
+            device=DEVICE,
+        )
+
+        candidates = torch.tensor(
+            [example["candidates"]],
+            dtype=torch.long,
+            device=DEVICE,
+        )
+
+        target = example["probs"].to(
+            DEVICE
+        ).unsqueeze(0)
+
+        counts = example["counts"].to(
+            DEVICE
+        ).unsqueeze(0)
+
+        logits = model(
+            context,
+            candidates,
+        )
+
+        predicted = F.softmax(
+            logits,
+            dim=-1,
+        )
+
+        metrics = distribution_metrics(
+            target,
+            predicted,
+            counts,
+        )
+
+        row = {}
+
+        for key, value in metrics.items():
+            row[key] = float(
+                value.mean().cpu()
+            )
+
+        row["top1"] = int(
+            target.argmax(dim=-1).item()
+            == predicted.argmax(dim=-1).item()
+        )
+
+        rows.append(row)
+
+    return rows
+
+
+# ============================================================
+# GENERATION
+# ============================================================
+
+@torch.no_grad()
+def generate(
+    model: SumDiagNetwork,
+    prompt: str,
+    word_to_idx: dict[str, int],
+    idx_to_word: dict[int, str],
+    max_new_tokens: int = 100,
+    temperature: float = 1.0,
+    top_k: int = 25,
+):
+    model.eval()
+
+    if max_new_tokens < 1:
+        raise ValueError(
+            "max_new_tokens must be at least 1"
+        )
+
+    prompt_tokens = tokenize(prompt)
+
+    if not prompt_tokens:
+        prompt_tokens = ["<unk>"]
+
+    unk_id = word_to_idx["<unk>"]
+
+    ids = [
+        word_to_idx.get(token, unk_id)
+        for token in prompt_tokens
+    ]
+
+    generation_temperature = max(
+        float(temperature),
+        1e-4,
+    )
+
+    vocab_size = len(word_to_idx)
+    pad_id = word_to_idx.get("<pad>")
+
+    for _ in range(max_new_tokens):
+        if len(ids) >= 2:
+            context_ids = ids[-2:]
+        else:
+            context_ids = [
+                unk_id,
+                ids[-1],
+            ]
+
+        context = torch.tensor(
+            [context_ids],
+            dtype=torch.long,
+            device=DEVICE,
+        )
+
+        candidates = torch.arange(
+            vocab_size,
+            dtype=torch.long,
+            device=DEVICE,
+        ).unsqueeze(0)
+
+        logits = model(
+            context,
+            candidates,
+        ).squeeze(0)
+
+        logits = logits / generation_temperature
+
+        if pad_id is not None:
+            logits[pad_id] = -torch.inf
+
+        if top_k > 0:
+            k = min(
+                int(top_k),
+                logits.numel(),
+            )
+
+            values, indices = torch.topk(
+                logits,
+                k=k,
+            )
+
+            probabilities = F.softmax(
+                values,
+                dim=-1,
+            )
+
+            selected = torch.multinomial(
+                probabilities,
+                num_samples=1,
+            )
+
+            next_id = int(
+                indices[selected].item()
+            )
+        else:
+            probabilities = F.softmax(
+                logits,
+                dim=-1,
+            )
+
+            next_id = int(
+                torch.multinomial(
+                    probabilities,
+                    num_samples=1,
+                ).item()
+            )
+
+        ids.append(next_id)
+
+    output = detokenize(
+        [
+            idx_to_word.get(index, "<unk>")
+            for index in ids
+        ]
+    )
+
+    return output or prompt.strip() or "<unk>"
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train a SUM + DIAG trigram generator "
+            "and generate text from a task prompt."
+        )
+    )
+
+    parser.add_argument(
+        "--corpus",
+        required=True,
+        help="Training corpus path",
+    )
+
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=2,
+    )
+
+    parser.add_argument(
+        "--max-vocab",
+        type=int,
+        default=5000,
+    )
+
+    parser.add_argument(
+        "--candidate-k",
+        type=int,
+        default=128,
+    )
+
+    parser.add_argument(
+        "--embed-dim",
+        type=int,
+        default=96,
+    )
+
+    parser.add_argument(
+        "--hidden-dim",
+        type=int,
+        default=192,
+    )
+
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=2e-3,
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=7,
+    )
+
+    parser.add_argument(
+        "--task",
+        default=None,
+        help=(
+            "Task description used to construct "
+            "a structured prompt."
+        ),
+    )
+
+    parser.add_argument(
+        "--prompt",
+        default=None,
+        help=(
+            "Raw prompt. Ignored when --task "
+            "is supplied."
+        ),
+    )
+
+    parser.add_argument(
+        "--generate",
+        type=int,
+        default=100,
+        help=(
+            "Number of new tokens to generate. "
+            "Default: 100."
+        ),
+    )
+
+    parser.add_argument(
+        "--generation-temperature",
+        type=float,
+        default=1.0,
+    )
+
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=25,
+    )
+
+    parser.add_argument(
+        "--model-output",
+        default="sum_diag_generator.pt",
+    )
+
+    parser.add_argument(
+        "--audit-output",
+        default="empirical_target_audit.json",
+    )
+
+    args = parser.parse_args()
+
+    if args.epochs < 1:
+        raise ValueError(
+            "--epochs must be at least 1"
+        )
+
+    if args.max_vocab < len(SPECIAL):
+        raise ValueError(
+            f"--max-vocab must be at least "
+            f"{len(SPECIAL)}"
+        )
+
+    if args.embed_dim < 1:
+        raise ValueError(
+            "--embed-dim must be at least 1"
+        )
+
+    if args.hidden_dim < 1:
+        raise ValueError(
+            "--hidden-dim must be at least 1"
+        )
+
+    if args.lr <= 0:
+        raise ValueError(
+            "--lr must be greater than zero"
+        )
+
+    if args.generate < 1:
+        raise ValueError(
+            "--generate must be at least 1"
+        )
+
+    if args.generation_temperature <= 0:
+        raise ValueError(
+            "--generation-temperature must "
+            "be greater than zero"
+        )
+
+    if args.top_k < 0:
+        raise ValueError(
+            "--top-k cannot be negative"
+        )
+
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    print(f"device = {DEVICE}")
+
+    # --------------------------------------------------------
+    # Corpus
+    # --------------------------------------------------------
+
+    corpus_path = Path(args.corpus)
+
+    if not corpus_path.is_file():
+        raise FileNotFoundError(
+            f"Corpus file does not exist: {corpus_path}"
+        )
+
+    text = corpus_path.read_text(
+        encoding="utf-8",
+    )
+
+    tokens = tokenize(text)[:9999]
+
+    if len(tokens) < 3:
+        raise RuntimeError(
+            "The corpus must contain at least "
+            "three recognized tokens."
+        )
+
+    print(f"tokens = {len(tokens):,}")
+
+    # --------------------------------------------------------
+    # Vocabulary
+    # --------------------------------------------------------
+
+    (
+        vocab,
+        word_to_idx,
+        idx_to_word,
+        ids,
+    ) = build_vocab(
+        tokens,
+        args.max_vocab,
+    )
+
+    print(f"vocab = {len(vocab):,}")
+
+    # --------------------------------------------------------
+    # Trigrams
+    # --------------------------------------------------------
+
+    (
+        trigram_counts,
+        context_counts,
+        continuation_counts,
+    ) = build_trigram_statistics(ids)
+
+    if not trigram_counts:
+        raise RuntimeError(
+            "No trigrams were generated."
+        )
+
+    print(
+        f"unique trigrams = "
+        f"{len(trigram_counts):,}"
+    )
+
+    print(
+        f"contexts = "
+        f"{len(continuation_counts):,}"
+    )
+
+    # --------------------------------------------------------
+    # Empirical examples
+    # --------------------------------------------------------
+
+    examples = build_examples(
+        continuation_counts,
+        args.candidate_k,
+    )
+
+    if not examples:
+        raise RuntimeError(
+            "No usable trigram examples were generated."
+        )
+
+    total_footprint = sum(
+        example["footprint"]
+        for example in examples
+    )
+
+    mean_entropy = sum(
+        example["entropy"]
+        for example in examples
+    ) / len(examples)
+
+    mean_support = sum(
+        example["support"]
+        for example in examples
+    ) / len(examples)
+
+    mean_effective_support = sum(
+        example["effective_support"]
+        for example in examples
+    ) / len(examples)
+
+    print()
+    print("DATASET FOOTPRINT")
+    print("-" * 60)
+    print(
+        "combinatorial sum C(n,2) = "
+        f"{total_footprint:,.0f}"
+    )
+    print(
+        f"mean support             = "
+        f"{mean_support:.4f}"
+    )
+    print(
+        "mean effective support   = "
+        f"{mean_effective_support:.4f}"
+    )
+    print(
+        f"mean entropy             = "
+        f"{mean_entropy:.6f}"
+    )
+
+    # --------------------------------------------------------
+    # Geometry and model
+    # --------------------------------------------------------
+
+    geometry = build_geometry(
+        len(vocab),
+        trigram_counts,
+    ).to(DEVICE)
+
+    model = SumDiagNetwork(
+        vocab_size=len(vocab),
+        geometry=geometry,
+        embed_dim=args.embed_dim,
+        hidden_dim=args.hidden_dim,
+    ).to(DEVICE)
+
+    parameter_count = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+
+    print(
+        f"trainable parameters = "
+        f"{parameter_count:,}"
+    )
+
+    # --------------------------------------------------------
+    # Training
+    # --------------------------------------------------------
+
+    history = train(
+        model,
+        examples,
+        epochs=args.epochs,
+        learning_rate=args.lr,
+    )
+
+    # --------------------------------------------------------
+    # Evaluation
+    # --------------------------------------------------------
+
+    results = evaluate(
+        model,
+        examples,
+    )
+
+    mean_kl = sum(
+        result["kl"]
+        for result in results
+    ) / len(results)
+
+    mean_js = sum(
+        result["js"]
+        for result in results
+    ) / len(results)
+
+    top1 = sum(
+        result["top1"]
+        for result in results
+    ) / len(results)
+
+    print()
+    print("FINAL DATASET <-> NEURAL CHECK")
+    print("-" * 60)
+    print(f"KL                  = {mean_kl:.8f}")
+    print(f"JS                  = {mean_js:.8f}")
+    print(f"top-1 agreement     = {top1:.4f}")
+    print(
+        "learned temperature  = "
+        f"{model.temperature.item():.6f}"
+    )
+    print(
+        "synaptic strength    = "
+        f"{model.syn_strength.item():.6f}"
+    )
+    print(
+        "geometry strength    = "
+        f"{model.geometry_strength.item():.6f}"
+    )
+
+    # --------------------------------------------------------
+    # Save checkpoint
+    # --------------------------------------------------------
+
+    checkpoint = {
+        "model_state": model.state_dict(),
+        "vocab": vocab,
+        "word_to_idx": word_to_idx,
+        "idx_to_word": idx_to_word,
+        "geometry": geometry.cpu(),
+        "history": history,
+        "config": {
+            "embed_dim": args.embed_dim,
+            "hidden_dim": args.hidden_dim,
+            "max_vocab": args.max_vocab,
+            "candidate_k": args.candidate_k,
+        },
+        "dataset_footprint": {
+            "combinatorial": total_footprint,
+            "mean_support": mean_support,
+            "mean_effective_support": (
+                mean_effective_support
+            ),
+            "mean_entropy": mean_entropy,
+        },
+    }
+
+    torch.save(
+        checkpoint,
+        args.model_output,
+    )
+
+    # --------------------------------------------------------
+    # Save audit
+    # --------------------------------------------------------
+
+    audit = {
+        "device": str(DEVICE),
+        "dataset": {
+            "tokens": len(tokens),
+            "vocab": len(vocab),
+            "trigrams": len(trigram_counts),
+            "contexts": len(continuation_counts),
+            "examples": len(examples),
+        },
+        "footprint": {
+            "combinatorial": total_footprint,
+            "mean_support": mean_support,
+            "mean_effective_support": (
+                mean_effective_support
+            ),
+            "mean_entropy": mean_entropy,
+        },
+        "final": {
+            "mean_kl": mean_kl,
+            "mean_js": mean_js,
+            "top1": top1,
+            "temperature": (
+                model.temperature.item()
+            ),
+            "syn_strength": (
+                model.syn_strength.item()
+            ),
+            "geometry_strength": (
+                model.geometry_strength.item()
+            ),
+        },
+        "history": history,
+    }
+
+    with Path(args.audit_output).open(
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            audit,
+            file,
+            indent=2,
+        )
+
+    # --------------------------------------------------------
+    # Prompt construction
+    # --------------------------------------------------------
+
+    if args.task:
+        generation_prompt = build_prompt(
+            args.task
+        )
+    elif args.prompt:
+        generation_prompt = args.prompt
+    else:
+        generation_prompt = "the"
+
+    # --------------------------------------------------------
+    # Generation
+    # --------------------------------------------------------
+
+    print()
+    print("=" * 78)
+    print("PROMPT")
+    print("=" * 78)
+    print(generation_prompt)
+
+    print()
+    print("=" * 78)
+    print("NEURAL GENERATION")
+    print("=" * 78)
+    print(
+        f"generating {args.generate} new tokens"
+    )
+    print()
+
+    generated = generate(
+        model=model,
+        prompt=generation_prompt,
+        word_to_idx=word_to_idx,
+        idx_to_word=idx_to_word,
+        max_new_tokens=args.generate,
+        temperature=args.generation_temperature,
+        top_k=args.top_k,
+    )
+
+    print(generated)
+    print()
+
+    print("saved:")
+    print(f"  {args.model_output}")
+    print(f"  {args.audit_output}")
+
+
+if __name__ == "__main__":
+    main()

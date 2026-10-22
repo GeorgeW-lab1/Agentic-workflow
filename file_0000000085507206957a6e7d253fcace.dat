@@ -1,0 +1,413 @@
+In file included from src/global.h:8,
+                 from src/app/application.h:2,
+                 from src/app/application.cpp:1:
+src/mining/miner.h:50:72: error: 'PsramAllocator' was not declared in this scope
+     using AsicJobMap = std::map<uint8_t, asic_job, std::less<uint8_t>, PsramAllocator<std::pair<const uint8_t, asic_job>>>;
+                                                                        ^~~~~~~~~~~~~~
+src/mining/miner.h:50:120: error: template argument 4 is invalid
+     using AsicJobMap = std::map<uint8_t, asic_job, std::less<uint8_t>, PsramAllocator<std::pair<const uint8_t, asic_job>>>;
+                                                                                                                        ^~
+src/mining/miner.h:51:76: error: 'PsramAllocator' was not declared in this scope
+     using AsicJobStringMap = std::map<uint8_t, String, std::less<uint8_t>, PsramAllocator<std::pair<const uint8_t, String>>>;
+                                                                            ^~~~~~~~~~~~~~
+src/mining/miner.h:51:122: error: template argument 4 is invalid
+     using AsicJobStringMap = std::map<uint8_t, String, std::less<uint8_t>, PsramAllocator<std::pair<const uint8_t, String>>>;
+                                                                                                                          ^~
+src/mining/miner.h:57:5: error: 'AsicJobMap' does not name a type
+     AsicJobMap                  _asic_job_map;
+     ^~~~~~~~~~
+src/mining/miner.h:58:5: error: 'AsicJobStringMap' does not name a type
+     AsicJobStringMap            _extranonce2_map;
+     ^~~~~~~~~~~~~~~~
+src/mining/miner.h:59:5: error: 'AsicJobStringMap' does not name a type
+     AsicJobStringMap            _pool_job_id_map;   // bind asic_job_id -> pool_job_id at construction time
+     ^~~~~~~~~~~~~~~~
+src/mining/miner.h:60:45: error: 'PsramAllocator' was not declared in this scope
+     std::deque<std::pair<uint32_t, double>, PsramAllocator<std::pair<uint32_t, double>>> _hr_deque; // single 60-min sample ring (PSRAM)
+                                             ^~~~~~~~~~~~~~
+src/mining/miner.h:60:86: error: template argument 2 is invalid
+     std::deque<std::pair<uint32_t, double>, PsramAllocator<std::pair<uint32_t, double>>> _hr_deque; // single 60-min sample ring (PSRAM)
+                                                                                      ^~
+src/mining/miner.h:60:88: error: expected unqualified-id before '>' token
+     std::deque<std::pair<uint32_t, double>, PsramAllocator<std::pair<uint32_t, double>>> _hr_deque; // single 60-min sample ring (PSRAM)
+                                                                                        ^
+src/mining/miner.h:100:58: error: 'PsramAllocator' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                          ^~~~~~~~~~~~~~
+src/mining/miner.h:100:73: error: template argument 2 is invalid
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                         ^~~~~~~~~~~~~~~~
+src/mining/miner.h:100:58: error: 'PsramAllocator' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                          ^~~~~~~~~~~~~~
+src/mining/miner.h:100:89: error: template argument 2 is invalid
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                         ^~
+src/mining/miner.h:100:58: error: 'PsramAllocator' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                          ^~~~~~~~~~~~~~
+src/mining/miner.h:100:89: error: template argument 2 is invalid
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                         ^~
+src/mining/miner.h:100:34: error: variable or field 'add_share_diff_history' declared void
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                  ^~~~~
+src/mining/miner.h:100:58: error: 'PsramAllocator' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                          ^~~~~~~~~~~~~~
+src/mining/miner.h:100:89: error: template argument 2 is invalid
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                         ^~
+src/mining/miner.h:100:93: error: 'hist' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                             ^~~~
+src/mining/miner.h:100:93: note: suggested alternative: 'uint'
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                             ^~~~
+                                                                                             uint
+src/mining/miner.h:100:116: error: expected primary-expression before '&' token
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                                                    ^
+src/mining/miner.h:100:117: error: 'node' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                                                     ^~~~
+src/mining/miner.h:100:117: note: suggested alternative: 'tone'
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                                                     ^~~~
+                                                                                                                     tone
+src/mining/miner.h:100:130: error: expected primary-expression before 'max_history'
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                                                                  ^~~~~~~~~~~
+Compiling .pio\build\NMAxe\src\drivers\displays\symbol\symbol_24.c.o
+Compiling .pio\build\NMAxe\src\drivers\displays\symbol\symbol_26.c.o
+Compiling .pio\build\NMAxe\src\drivers\displays\symbol\symbol_28.c.o
+Compiling .pio\build\NMAxe\src\drivers\displays\symbol\symbol_30.c.o
+Compiling .pio\build\NMAxe\src\drivers\extio\tca9554.cpp.o
+Compiling .pio\build\NMAxe\src\drivers\fan\fan.cpp.o
+Compiling .pio\build\NMAxe\src\drivers\fan\tmp102.cpp.o
+Compiling .pio\build\NMAxe\src\drivers\iic\i2c_master.cpp.o
+Compiling .pio\build\NMAxe\src\drivers\power\axp2101\axp2101.cpp.o
+Compiling .pio\build\NMAxe\src\drivers\power\husb238\husb238.cpp.o
+*** [.pio\build\NMAxe\src\app\application.cpp.o] Error 1In file included from src/global.h:8,
+                 from src/drivers/displays/display.cpp:5:
+src/mining/miner.h:50:72: error: 'PsramAllocator' was not declared in this scope
+     using AsicJobMap = std::map<uint8_t, asic_job, std::less<uint8_t>, PsramAllocator<std::pair<const uint8_t, asic_job>>>;
+                                                                        ^~~~~~~~~~~~~~
+src/mining/miner.h:50:120: error: template argument 4 is invalid
+     using AsicJobMap = std::map<uint8_t, asic_job, std::less<uint8_t>, PsramAllocator<std::pair<const uint8_t, asic_job>>>;
+                                                                                                                        ^~
+src/mining/miner.h:51:76: error: 'PsramAllocator' was not declared in this scope
+     using AsicJobStringMap = std::map<uint8_t, String, std::less<uint8_t>, PsramAllocator<std::pair<const uint8_t, String>>>;
+                                                                            ^~~~~~~~~~~~~~
+src/mining/miner.h:51:122: error: template argument 4 is invalid
+     using AsicJobStringMap = std::map<uint8_t, String, std::less<uint8_t>, PsramAllocator<std::pair<const uint8_t, String>>>;
+                                                                                                                          ^~
+src/mining/miner.h:57:5: error: 'AsicJobMap' does not name a type
+     AsicJobMap                  _asic_job_map;
+     ^~~~~~~~~~
+src/mining/miner.h:58:5: error: 'AsicJobStringMap' does not name a type
+     AsicJobStringMap            _extranonce2_map;
+     ^~~~~~~~~~~~~~~~
+src/mining/miner.h:59:5: error: 'AsicJobStringMap' does not name a type
+     AsicJobStringMap            _pool_job_id_map;   // bind asic_job_id -> pool_job_id at construction time
+     ^~~~~~~~~~~~~~~~
+src/mining/miner.h:60:45: error: 'PsramAllocator' was not declared in this scope
+     std::deque<std::pair<uint32_t, double>, PsramAllocator<std::pair<uint32_t, double>>> _hr_deque; // single 60-min sample ring (PSRAM)
+                                             ^~~~~~~~~~~~~~
+src/mining/miner.h:60:86: error: template argument 2 is invalid
+     std::deque<std::pair<uint32_t, double>, PsramAllocator<std::pair<uint32_t, double>>> _hr_deque; // single 60-min sample ring (PSRAM)
+                                                                                      ^~
+src/mining/miner.h:60:88: error: expected unqualified-id before '>' token
+     std::deque<std::pair<uint32_t, double>, PsramAllocator<std::pair<uint32_t, double>>> _hr_deque; // single 60-min sample ring (PSRAM)
+                                                                                        ^
+src/mining/miner.h:100:58: error: 'PsramAllocator' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                          ^~~~~~~~~~~~~~
+src/mining/miner.h:100:73: error: template argument 2 is invalid
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                         ^~~~~~~~~~~~~~~~
+src/mining/miner.h:100:58: error: 'PsramAllocator' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                          ^~~~~~~~~~~~~~
+src/mining/miner.h:100:89: error: template argument 2 is invalid
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                         ^~
+src/mining/miner.h:100:58: error: 'PsramAllocator' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                          ^~~~~~~~~~~~~~
+src/mining/miner.h:100:89: error: template argument 2 is invalid
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                         ^~
+src/mining/miner.h:100:34: error: variable or field 'add_share_diff_history' declared void
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                  ^~~~~
+src/mining/miner.h:100:58: error: 'PsramAllocator' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                          ^~~~~~~~~~~~~~
+src/mining/miner.h:100:89: error: template argument 2 is invalid
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                         ^~
+src/mining/miner.h:100:93: error: 'hist' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                             ^~~~
+src/mining/miner.h:100:93: note: suggested alternative: 'uint'
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                             ^~~~
+                                                                                             uint
+src/mining/miner.h:100:116: error: expected primary-expression before '&' token
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                                                    ^
+src/mining/miner.h:100:117: error: 'node' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                                                     ^~~~
+src/mining/miner.h:100:117: note: suggested alternative: 'tone'
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                                                     ^~~~
+                                                                                                                     tone
+src/mining/miner.h:100:130: error: expected primary-expression before 'max_history'
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                                                                  ^~~~~~~~~~~
+In file included from src/global.h:8,
+                 from src/drivers/fan/fan.cpp:3:
+src/mining/miner.h:50:72: error: 'PsramAllocator' was not declared in this scope
+     using AsicJobMap = std::map<uint8_t, asic_job, std::less<uint8_t>, PsramAllocator<std::pair<const uint8_t, asic_job>>>;
+                                                                        ^~~~~~~~~~~~~~
+In file included from src/global.h:8,
+                 from src/drivers/extio/tca9554.cpp:5:
+src/mining/miner.h:50:72: error: 'PsramAllocator' was not declared in this scope
+     using AsicJobMap = std::map<uint8_t, asic_job, std::less<uint8_t>, PsramAllocator<std::pair<const uint8_t, asic_job>>>;
+                                                                        ^~~~~~~~~~~~~~
+src/mining/miner.h:50:120: error: template argument 4 is invalid
+     using AsicJobMap = std::map<uint8_t, asic_job, std::less<uint8_t>, PsramAllocator<std::pair<const uint8_t, asic_job>>>;
+                                                                                                                        ^~
+src/mining/miner.h:51:76: error: 'PsramAllocator' was not declared in this scope
+     using AsicJobStringMap = std::map<uint8_t, String, std::less<uint8_t>, PsramAllocator<std::pair<const uint8_t, String>>>;
+                                                                            ^~~~~~~~~~~~~~
+src/mining/miner.h:50:120: error: template argument 4 is invalid
+     using AsicJobMap = std::map<uint8_t, asic_job, std::less<uint8_t>, PsramAllocator<std::pair<const uint8_t, asic_job>>>;
+                                                                                                                        ^~
+src/mining/miner.h:51:76: error: 'PsramAllocator' was not declared in this scope
+     using AsicJobStringMap = std::map<uint8_t, String, std::less<uint8_t>, PsramAllocator<std::pair<const uint8_t, String>>>;
+                                                                            ^~~~~~~~~~~~~~
+src/mining/miner.h:51:122: error: template argument 4 is invalid
+     using AsicJobStringMap = std::map<uint8_t, String, std::less<uint8_t>, PsramAllocator<std::pair<const uint8_t, String>>>;
+                                                                                                                          ^~
+src/mining/miner.h:51:122: error: template argument 4 is invalid
+     using AsicJobStringMap = std::map<uint8_t, String, std::less<uint8_t>, PsramAllocator<std::pair<const uint8_t, String>>>;
+                                                                                                                          ^~
+src/mining/miner.h:57:5: error: 'AsicJobMap' does not name a type
+     AsicJobMap                  _asic_job_map;
+     ^~~~~~~~~~
+src/mining/miner.h:57:5: error: 'AsicJobMap' does not name a type
+     AsicJobMap                  _asic_job_map;
+     ^~~~~~~~~~
+src/mining/miner.h:58:5: error: 'AsicJobStringMap' does not name a type
+     AsicJobStringMap            _extranonce2_map;
+     ^~~~~~~~~~~~~~~~
+src/mining/miner.h:58:5: error: 'AsicJobStringMap' does not name a type
+     AsicJobStringMap            _extranonce2_map;
+     ^~~~~~~~~~~~~~~~
+src/mining/miner.h:59:5: error: 'AsicJobStringMap' does not name a type
+     AsicJobStringMap            _pool_job_id_map;   // bind asic_job_id -> pool_job_id at construction time
+     ^~~~~~~~~~~~~~~~
+src/mining/miner.h:60:45: error: 'PsramAllocator' was not declared in this scope
+     std::deque<std::pair<uint32_t, double>, PsramAllocator<std::pair<uint32_t, double>>> _hr_deque; // single 60-min sample ring (PSRAM)
+                                             ^~~~~~~~~~~~~~
+src/mining/miner.h:59:5: error: 'AsicJobStringMap' does not name a type
+     AsicJobStringMap            _pool_job_id_map;   // bind asic_job_id -> pool_job_id at construction time
+     ^~~~~~~~~~~~~~~~
+src/mining/miner.h:60:45: error: 'PsramAllocator' was not declared in this scope
+     std::deque<std::pair<uint32_t, double>, PsramAllocator<std::pair<uint32_t, double>>> _hr_deque; // single 60-min sample ring (PSRAM)
+                                             ^~~~~~~~~~~~~~
+src/mining/miner.h:60:86: error: template argument 2 is invalid
+     std::deque<std::pair<uint32_t, double>, PsramAllocator<std::pair<uint32_t, double>>> _hr_deque; // single 60-min sample ring (PSRAM)
+                                                                                      ^~
+src/mining/miner.h:60:88: error: expected unqualified-id before '>' token
+     std::deque<std::pair<uint32_t, double>, PsramAllocator<std::pair<uint32_t, double>>> _hr_deque; // single 60-min sample ring (PSRAM)
+                                                                                        ^
+src/mining/miner.h:100:58: error: 'PsramAllocator' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                          ^~~~~~~~~~~~~~
+src/mining/miner.h:60:86: error: template argument 2 is invalid
+     std::deque<std::pair<uint32_t, double>, PsramAllocator<std::pair<uint32_t, double>>> _hr_deque; // single 60-min sample ring (PSRAM)
+                                                                                      ^~
+src/mining/miner.h:60:88: error: expected unqualified-id before '>' token
+     std::deque<std::pair<uint32_t, double>, PsramAllocator<std::pair<uint32_t, double>>> _hr_deque; // single 60-min sample ring (PSRAM)
+                                                                                        ^
+src/mining/miner.h:100:58: error: 'PsramAllocator' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                          ^~~~~~~~~~~~~~
+In file included from src/global.h:8,
+                 from src/drivers/fan/tmp102.cpp:5:
+src/mining/miner.h:50:72: error: 'PsramAllocator' was not declared in this scope
+     using AsicJobMap = std::map<uint8_t, asic_job, std::less<uint8_t>, PsramAllocator<std::pair<const uint8_t, asic_job>>>;
+                                                                        ^~~~~~~~~~~~~~
+src/mining/miner.h:100:73: error: template argument 2 is invalid
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                         ^~~~~~~~~~~~~~~~
+src/mining/miner.h:100:58: error: 'PsramAllocator' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                          ^~~~~~~~~~~~~~
+src/mining/miner.h:100:73: error: template argument 2 is invalid
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                         ^~~~~~~~~~~~~~~~
+src/mining/miner.h:100:58: error: 'PsramAllocator' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                          ^~~~~~~~~~~~~~
+src/mining/miner.h:100:89: error: template argument 2 is invalid
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                         ^~
+src/mining/miner.h:100:58: error: 'PsramAllocator' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                          ^~~~~~~~~~~~~~
+src/mining/miner.h:50:120: error: template argument 4 is invalid
+     using AsicJobMap = std::map<uint8_t, asic_job, std::less<uint8_t>, PsramAllocator<std::pair<const uint8_t, asic_job>>>;
+                                                                                                                        ^~
+src/mining/miner.h:51:76: error: 'PsramAllocator' was not declared in this scope
+     using AsicJobStringMap = std::map<uint8_t, String, std::less<uint8_t>, PsramAllocator<std::pair<const uint8_t, String>>>;
+                                                                            ^~~~~~~~~~~~~~
+src/mining/miner.h:100:89: error: template argument 2 is invalid
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                         ^~
+src/mining/miner.h:100:58: error: 'PsramAllocator' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                          ^~~~~~~~~~~~~~
+src/mining/miner.h:100:89: error: template argument 2 is invalid
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                         ^~
+src/mining/miner.h:100:34: error: variable or field 'add_share_diff_history' declared void
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                  ^~~~~
+src/mining/miner.h:100:58: error: 'PsramAllocator' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                          ^~~~~~~~~~~~~~
+src/mining/miner.h:100:89: error: template argument 2 is invalid
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                         ^~
+src/mining/miner.h:100:34: error: variable or field 'add_share_diff_history' declared void
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                  ^~~~~
+src/mining/miner.h:100:58: error: 'PsramAllocator' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                          ^~~~~~~~~~~~~~
+src/mining/miner.h:51:122: error: template argument 4 is invalid
+     using AsicJobStringMap = std::map<uint8_t, String, std::less<uint8_t>, PsramAllocator<std::pair<const uint8_t, String>>>;
+                                                                                                                          ^~
+src/mining/miner.h:100:89: error: template argument 2 is invalid
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                         ^~
+src/mining/miner.h:100:93: error: 'hist' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                             ^~~~
+src/mining/miner.h:57:5: error: 'AsicJobMap' does not name a type
+     AsicJobMap                  _asic_job_map;
+     ^~~~~~~~~~
+src/mining/miner.h:100:93: note: suggested alternative: 'uint'
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                             ^~~~
+                                                                                             uint
+src/mining/miner.h:100:116: error: expected primary-expression before '&' token
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                                                    ^
+src/mining/miner.h:100:117: error: 'node' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                                                     ^~~~
+src/mining/miner.h:100:89: error: template argument 2 is invalid
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                         ^~
+src/mining/miner.h:100:93: error: 'hist' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                             ^~~~
+src/mining/miner.h:100:93: note: suggested alternative: 'uint'
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                             ^~~~
+                                                                                             uint
+src/mining/miner.h:100:116: error: expected primary-expression before '&' token
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                                                    ^
+src/mining/miner.h:100:117: error: 'node' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                                                     ^~~~
+src/mining/miner.h:100:117: note: suggested alternative: 'tone'
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                                                     ^~~~
+                                                                                                                     tone
+src/mining/miner.h:100:130: error: expected primary-expression before 'max_history'
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                                                                  ^~~~~~~~~~~
+src/mining/miner.h:100:117: note: suggested alternative: 'tone'
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                                                     ^~~~
+                                                                                                                     tone
+src/mining/miner.h:100:130: error: expected primary-expression before 'max_history'
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                                                                  ^~~~~~~~~~~
+src/mining/miner.h:58:5: error: 'AsicJobStringMap' does not name a type
+     AsicJobStringMap            _extranonce2_map;
+     ^~~~~~~~~~~~~~~~
+src/mining/miner.h:59:5: error: 'AsicJobStringMap' does not name a type
+     AsicJobStringMap            _pool_job_id_map;   // bind asic_job_id -> pool_job_id at construction time
+     ^~~~~~~~~~~~~~~~
+src/mining/miner.h:60:45: error: 'PsramAllocator' was not declared in this scope
+     std::deque<std::pair<uint32_t, double>, PsramAllocator<std::pair<uint32_t, double>>> _hr_deque; // single 60-min sample ring (PSRAM)
+                                             ^~~~~~~~~~~~~~
+src/mining/miner.h:60:86: error: template argument 2 is invalid
+     std::deque<std::pair<uint32_t, double>, PsramAllocator<std::pair<uint32_t, double>>> _hr_deque; // single 60-min sample ring (PSRAM)
+                                                                                      ^~
+src/mining/miner.h:60:88: error: expected unqualified-id before '>' token
+     std::deque<std::pair<uint32_t, double>, PsramAllocator<std::pair<uint32_t, double>>> _hr_deque; // single 60-min sample ring (PSRAM)
+                                                                                        ^
+src/mining/miner.h:100:58: error: 'PsramAllocator' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                          ^~~~~~~~~~~~~~
+src/mining/miner.h:100:73: error: template argument 2 is invalid
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                         ^~~~~~~~~~~~~~~~
+src/mining/miner.h:100:58: error: 'PsramAllocator' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                          ^~~~~~~~~~~~~~
+src/mining/miner.h:100:89: error: template argument 2 is invalid
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                         ^~
+src/mining/miner.h:100:58: error: 'PsramAllocator' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                          ^~~~~~~~~~~~~~
+src/mining/miner.h:100:89: error: template argument 2 is invalid
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                         ^~
+src/mining/miner.h:100:34: error: variable or field 'add_share_diff_history' declared void
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                  ^~~~~
+src/mining/miner.h:100:58: error: 'PsramAllocator' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                          ^~~~~~~~~~~~~~
+src/mining/miner.h:100:89: error: template argument 2 is invalid
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                         ^~
+src/mining/miner.h:100:93: error: 'hist' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                             ^~~~
+src/mining/miner.h:100:93: note: suggested alternative: 'uint'
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                             ^~~~
+                                                                                             uint
+src/mining/miner.h:100:116: error: expected primary-expression before '&' token
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                                                    ^
+src/mining/miner.h:100:117: error: 'node' was not declared in this scope
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                                                     ^~~~
+src/mining/miner.h:100:117: note: suggested alternative: 'tone'
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                                                     ^~~~
+                                                                                                                     tone
+src/mining/miner.h:100:130: error: expected primary-expression before 'max_history'
+ void add_share_diff_history(std::deque<proximity_node_t, PsramAllocator<proximity_node_t>> &hist, proximity_node_t &node, size_t max_history);
+                                                                                                                                  ^~~~~~~~~~~
+*** [.pio\build\NMAxe\src\drivers\fan\fan.cpp.o] Error 1*** [.pio\build\NMAxe\src\drivers\extio\tca9554.cpp.o] Error 1
+*** [.pio\build\NMAxe\src\drivers\fan\tmp102.cpp.o] Error 1
+*** [.pio\build\NMAxe\src\drivers\displays\display.cpp.o] Error 1
+============= [FAILED] Took 12.76 seconds =============
+
+ *  The terminal process "C:\Users\George\.platformio\penv\Scripts\platformio.exe 'run'" terminated with exit code: 1. 
+ *  Terminal will be reused by tasks, press any key to close it. 

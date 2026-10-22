@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""
+Non-isomorphic adiabatic scoring on top of Microsoft BitNet b1.58
+=================================================================
+
+The n-gram model F is replaced by BitNet's own next-token log-probabilities.
+Everything else is the original math:
+
+  g_k     three non-isomorphic fragment transforms (R^3, R^4, R^2)
+  D       consistency score, candidates with D > tau are removed
+  lambda  smoothstep ramp from exploratory to selective scoring
+  score   (1-lam)*(0.75*logp + 0.25*frag) + lam*(1.25*logp + 0.85*frag)
+
+The "new model" is a folder containing the BitNet weights + tokenizer plus
+nia_config.json (seed, tau, beam, temperature and the fragment matrices).
+
+Setup:
+  pip install -U torch transformers numpy accelerate
+
+Build + save (downloads BitNet once):
+  python nia_bitnet.py build --out ./nia-bitnet
+
+Load + generate:
+  python nia_bitnet.py generate --model ./nia-bitnet --prompt "The machine" --tokens 80
+
+Or from Python:
+  from nia_bitnet import NIAModel
+  m = NIAModel.load("./nia-bitnet")
+  print(m.generate("The machine", max_new_tokens=80))
+
+Note: this uses the bf16 transformers checkpoint. The 1.58-bit speed gains
+of bitnet.cpp do not apply here, because the scoring runs in Python.
+"""
+
+import argparse
+import json
+import os
+import shutil
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
+
+# No C++ compiler needed: run torch.compile'd helpers (BitNet unpack) eagerly.
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+
+import numpy as np
+import torch
+
+# BitNet checkpoint conversion may use torch.compile for weight unpacking.
+# On Windows without MSVC cl.exe, TorchInductor cannot compile that helper.
+# Disable Dynamo before Transformers imports its BitNet integration.
+try:
+    torch._dynamo.config.disable = True
+except Exception:
+    pass
+
+from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessor, LogitsProcessorList
+
+DEFAULT_BASE = "microsoft/bitnet-b1.58-2B-4T-bf16"
+CONFIG_NAME = "nia_config.json"
+
+
+# ----------------------------------------------------------------------------
+# Math (unchanged from the original script)
+# ----------------------------------------------------------------------------
+class NonIsomorphicFragments:
+    def __init__(self, seed: int = 17, weights: Dict[str, list] = None):
+        if weights is not None:
+            self.w_context = np.array(weights["w_context"], dtype=float)
+            self.w_word = np.array(weights["w_word"], dtype=float)
+            self.w_transition = np.array(weights["w_transition"], dtype=float)
+        else:
+            rng = np.random.default_rng(seed)
+            self.w_context = rng.normal(0, 0.7, size=(5, 3))
+            self.w_word = rng.normal(0, 0.7, size=(5, 4))
+            self.w_transition = rng.normal(0, 0.7, size=(5, 2))
+
+    def export(self) -> Dict[str, list]:
+        return {
+            "w_context": self.w_context.tolist(),
+            "w_word": self.w_word.tolist(),
+            "w_transition": self.w_transition.tolist(),
+        }
+
+    @staticmethod
+    def _unit(v: np.ndarray) -> np.ndarray:
+        n = float(np.linalg.norm(v))
+        return v / n if n > 1e-12 else np.zeros_like(v)
+
+    @staticmethod
+    def _hash_features(token: str, width: int) -> np.ndarray:
+        raw = token.lower().encode("utf-8", errors="ignore")
+        vals = np.zeros(width, dtype=float)
+        if not raw:
+            return vals
+        for i, byte in enumerate(raw):
+            vals[i % width] += ((byte % 31) - 15) / 15.0
+            vals[(i * 3 + 1) % width] += ((byte % 17) - 8) / 8.0
+        vals /= max(1, len(raw))
+        vals[0] += min(len(raw), 20) / 20.0
+        vals[1] += sum(chr(b).isalpha() for b in raw) / max(1, len(raw))
+        return np.tanh(vals)
+
+    def features(self, context: Sequence[str], token: str, logp: float, rank: int):
+        recent = list(context[-4:])
+        ctx_vec = np.zeros(5, dtype=float)
+        if recent:
+            for i, word in enumerate(recent):
+                ctx_vec += self._hash_features(word, 5) * (0.65 ** (len(recent) - i - 1))
+            ctx_vec /= max(1, len(recent))
+        word_vec = self._hash_features(token, 5)
+        transition_vec = np.array([
+            np.tanh(logp),
+            1.0 / (1.0 + rank),
+            1.0 if token[:1].isupper() else 0.0,
+            1.0 if token in ".,!?;:" else 0.0,
+            min(len(token), 24) / 24.0,
+        ], dtype=float)
+        g1 = np.tanh(ctx_vec @ self.w_context)
+        g2 = np.tanh(word_vec @ self.w_word)
+        g3 = np.tanh(transition_vec @ self.w_transition)
+        return g1, g2, g3
+
+    def score(self, context, token, logp, rank, lam) -> Tuple[float, float]:
+        g1, g2, g3 = self.features(context, token, logp, rank)
+        summaries = np.array([np.linalg.norm(g1), np.linalg.norm(g2), np.linalg.norm(g3)])
+        mean = float(np.mean(summaries))
+        spread = float(np.std(summaries) / (mean + 1e-9))
+        consistency = float(np.clip(0.55 * spread + 0.45 * (1.0 - np.mean(summaries)), 0.0, 1.0))
+
+        ref = self._unit(np.array([np.mean(g1), np.mean(g2), np.mean(g3), np.tanh(logp)]))
+        cand = self._unit(np.array([g1[0], g2[0], g3[0], np.tanh(logp + 0.1 * rank)]))
+        alignment = (float(np.dot(ref, cand)) + 1.0) / 2.0
+
+        frag = 1.6 * alignment - 1.15 * consistency
+        total = (1.0 - lam) * (0.75 * logp + 0.25 * frag) + lam * (1.25 * logp + 0.85 * frag)
+        return total, consistency
+
+
+def adiabatic_lambda(step: int, total_steps: int) -> float:
+    u = min(1.0, max(0.0, step / max(1, total_steps - 1)))
+    return 3.0 * u * u - 2.0 * u * u * u
+
+
+# ----------------------------------------------------------------------------
+# HF logits processor: BitNet logp -> fragment-scored, tau-filtered, beam-cut
+# ----------------------------------------------------------------------------
+class NIAProcessor(LogitsProcessor):
+    def __init__(self, tokenizer, fragments, prompt_len, total_steps,
+                 beam=8, tau=0.65, temperature=0.85):
+        self.tok = tokenizer
+        self.frag = fragments
+        self.prompt_len = prompt_len
+        self.total = max(1, total_steps)
+        self.beam = max(1, beam)
+        self.tau = tau
+        self.temperature = max(1e-3, temperature)
+        self._cache: Dict[int, str] = {}
+
+    def _s(self, tid: int) -> str:
+        if tid not in self._cache:
+            self._cache[tid] = self.tok.decode([tid]).strip()
+        return self._cache[tid]
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        step = input_ids.shape[1] - self.prompt_len
+        lam = adiabatic_lambda(step, self.total)
+        logp = torch.log_softmax(scores.float(), dim=-1)
+        k = min(max(40, self.beam * 8), logp.shape[-1])
+        top_lp, top_ids = logp.topk(k, dim=-1)
+        out = torch.full_like(scores, float("-inf"))
+
+        for b in range(input_ids.shape[0]):
+            ctx = [self._s(i) for i in input_ids[b, -4:].tolist()]
+            scored: List[Tuple[float, int]] = []
+            first = None
+            for rank, (tid, lp) in enumerate(zip(top_ids[b].tolist(), top_lp[b].tolist())):
+                s, c = self.frag.score(ctx, self._s(tid), lp, rank, lam)
+                if rank == 0:
+                    first = (s, tid)
+                if c <= self.tau:
+                    scored.append((s, tid))
+            if not scored:  # avoid dead end
+                scored = [first]
+            scored.sort(reverse=True)
+            for s, tid in scored[: self.beam]:
+                out[b, tid] = s / self.temperature
+        return out.to(scores.dtype)
+
+
+# ----------------------------------------------------------------------------
+# Saveable / loadable model
+# ----------------------------------------------------------------------------
+class NIAModel:
+    def __init__(self, model, tokenizer, config: dict):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.config = config
+        self.fragments = NonIsomorphicFragments(config["seed"], config["fragment_weights"])
+
+    @classmethod
+    def build(cls, base: str = DEFAULT_BASE, seed: int = 17, tau: float = 0.65,
+              beam: int = 8, temperature: float = 0.85, device_map="auto"):
+        print(f"Loading base model: {base}")
+        tok = AutoTokenizer.from_pretrained(base)
+        model = AutoModelForCausalLM.from_pretrained(base, dtype=torch.bfloat16, device_map=device_map)
+        frag = NonIsomorphicFragments(seed)
+        cfg = {"base_model": base, "seed": seed, "tau": tau, "beam": beam,
+               "temperature": temperature, "fragment_weights": frag.export()}
+        return cls(model, tok, cfg)
+
+    def save(self, path: str) -> None:
+        p = Path(path)
+        p.mkdir(parents=True, exist_ok=True)
+        self.model.save_pretrained(p)
+        self.tokenizer.save_pretrained(p)
+        (p / CONFIG_NAME).write_text(json.dumps(self.config, indent=2))
+        shutil.copy(Path(__file__).resolve(), p / "nia_bitnet.py")  # loader travels with the model
+
+    @classmethod
+    def load(cls, path: str, device_map="auto"):
+        p = Path(path)
+        cfg = json.loads((p / CONFIG_NAME).read_text())
+        tok = AutoTokenizer.from_pretrained(p)
+        model = AutoModelForCausalLM.from_pretrained(p, dtype=torch.bfloat16, device_map=device_map)
+        return cls(model, tok, cfg)
+
+    @torch.no_grad()
+    def generate(self, prompt: str, max_new_tokens: int = 80, seed: int = None, **overrides) -> str:
+        c = {**self.config, **overrides}
+        enc = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        proc = NIAProcessor(self.tokenizer, self.fragments, enc["input_ids"].shape[1],
+                            max_new_tokens, c["beam"], c["tau"], c["temperature"])
+        if seed is not None:
+            torch.manual_seed(seed)
+        out = self.model.generate(
+            **enc,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=1.0, top_k=0, top_p=1.0,  # processor handles temperature + cut
+            logits_processor=LogitsProcessorList([proc]),
+            pad_token_id=self.tokenizer.eos_token_id,
+        )
+        return self.tokenizer.decode(out[0], skip_special_tokens=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    b = sub.add_parser("build", help="download BitNet, attach the math, save a new model folder")
+    b.add_argument("--base", default=DEFAULT_BASE)
+    b.add_argument("--out", default="./nia-bitnet")
+    b.add_argument("--seed", type=int, default=17)
+    b.add_argument("--tau", type=float, default=0.65)
+    b.add_argument("--beam", type=int, default=8)
+    b.add_argument("--temperature", type=float, default=0.85)
+
+    g = sub.add_parser("generate", help="load a saved folder and generate")
+    g.add_argument("--model", default="./nia-bitnet")
+    g.add_argument("--prompt", default="A process")
+    g.add_argument("--tokens", type=int, default=80)
+    g.add_argument("--tau", type=float)
+    g.add_argument("--beam", type=int)
+    g.add_argument("--temperature", type=float)
+    g.add_argument("--seed", type=int, default=7)
+
+    a = ap.parse_args()
+    if a.cmd == "build":
+        m = NIAModel.build(a.base, a.seed, a.tau, a.beam, a.temperature)
+        m.save(a.out)
+        print(f"Saved to {a.out}. Load with: NIAModel.load('{a.out}')")
+    else:
+        m = NIAModel.load(a.model)
+        ov = {k: v for k, v in {"tau": a.tau, "beam": a.beam, "temperature": a.temperature}.items() if v is not None}
+        print(m.generate(a.prompt, a.tokens, seed=a.seed, **ov))
+
+
+if __name__ == "__main__":
+    main()

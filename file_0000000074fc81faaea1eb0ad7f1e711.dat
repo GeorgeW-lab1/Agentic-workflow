@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""
+Gate-level SiC phononic SHA-256 proof-of-work simulator.
+
+No hashlib or external SHA implementation is used for mining. SHA-256 is
+implemented as a Boolean network of NOT/XOR/AND/OR/MUX/MAJ and ripple-carry
+full-adder gates. Each logical gate is coupled to an illustrative phonon
+transport/noise/energy model.
+
+IMPORTANT:
+* This is a software simulation of a proposed phononic gate fabric, not a
+  physical wafer, measured device, or PDE-based phonon solver.
+* Logical outputs are evaluated ideally so the SHA-256 result is reproducible.
+  The thermal/noise model estimates reliability; it does not physically cause
+  the Boolean output.
+* Parameters are illustrative and must be calibrated to real SiC device data.
+"""
+import argparse
+import json
+import math
+import time
+from pathlib import Path
+
+MASK32 = 0xFFFFFFFF
+K_B = 1.380649e-23
+
+# Standard SHA-256 round constants and initial state.
+K = (
+  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+  0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+)
+H0 = (0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+      0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19)
+
+class PhononFabric:
+    """Ideal Boolean gate evaluation + illustrative transport telemetry."""
+    def __init__(self, temperature=300.0, length_m=2e-6, mfp_m=3e-7,
+                 gate_energy_j=2e-20, velocity_m_s=9000.0, attenuation_scale=1.0):
+        if temperature <= 0 or length_m < 0 or mfp_m <= 0 or gate_energy_j <= 0:
+            raise ValueError("T and MFP/energy must be positive; path length cannot be negative.")
+        self.temperature = temperature
+        self.length_m = length_m
+        self.mfp_m = mfp_m
+        self.gate_energy_j = gate_energy_j
+        self.velocity_m_s = velocity_m_s
+        self.attenuation_scale = attenuation_scale
+        self.counts = {}
+        self.energy_j = 0.0
+        self.delay_s = 0.0
+        self.logical_gates = 0
+        self.attenuation = math.exp(-length_m / mfp_m)
+        self.kT = K_B * temperature
+        # Illustrative threshold-margin model. This is not a measured SiC BER.
+        margin = math.sqrt(gate_energy_j / self.kT) * self.attenuation
+        self.p_flip = 0.5 * math.erfc(margin / math.sqrt(2.0))
+        self.p_flip = min(0.5, max(0.0, self.p_flip * attenuation_scale))
+
+    def gate(self, name, truth):
+        self.logical_gates += 1
+        self.counts[name] = self.counts.get(name, 0) + 1
+        # A real design would require gate-specific energy and path calibration.
+        self.energy_j += self.gate_energy_j
+        self.delay_s += self.length_m / self.velocity_m_s
+        return int(bool(truth))
+
+    def NOT(self, a): return self.gate("NOT", not bool(a))
+    def AND(self, a, b): return self.gate("AND", bool(a) and bool(b))
+    def OR(self, a, b): return self.gate("OR", bool(a) or bool(b))
+    def XOR(self, a, b): return self.gate("XOR", bool(a) ^ bool(b))
+    def MUX(self, x, y, z):
+        # Ch(x,y,z) = x ? y : z, constructed from gates.
+        return self.OR(self.AND(x, y), self.AND(self.NOT(x), z))
+    def MAJ(self, x, y, z):
+        # Majority(x,y,z) = xy + xz + yz.
+        return self.OR(self.OR(self.AND(x, y), self.AND(x, z)), self.AND(y, z))
+
+def word_bits(x):
+    return [(x >> i) & 1 for i in range(32)]
+
+def bits_word(bits):
+    out = 0
+    for i, b in enumerate(bits):
+        out |= (int(b) & 1) << i
+    return out & MASK32
+
+def xor_bits(f, *words):
+    out = [0] * 32
+    for i in range(32):
+        v = words[0][i]
+        for w in words[1:]:
+            v = f.XOR(v, w[i])
+        out[i] = v
+    return out
+
+def rotr_bits(bits, n):
+    n %= 32
+    return bits[n:] + bits[:n]
+
+def shr_bits(bits, n):
+    return bits[n:] + [0] * n
+
+def add_bits(f, a, b):
+    """32-bit ripple-carry adder built from XOR/AND/OR gates."""
+    out, carry = [], 0
+    for i in range(32):
+        axb = f.XOR(a[i], b[i])
+        s = f.XOR(axb, carry)
+        c1 = f.AND(a[i], b[i])
+        c2 = f.AND(axb, carry)
+        carry = f.OR(c1, c2)
+        out.append(s)
+    return out  # carry out discarded: arithmetic modulo 2**32
+
+def add_words(f, *values):
+    result = word_bits(values[0])
+    for value in values[1:]:
+        result = add_bits(f, result, word_bits(value))
+    return bits_word(result)
+
+def sigma0(f, x):
+    b = word_bits(x)
+    return bits_word(xor_bits(f, rotr_bits(b, 2), rotr_bits(b, 13), rotr_bits(b, 22)))
+
+def sigma1(f, x):
+    b = word_bits(x)
+    return bits_word(xor_bits(f, rotr_bits(b, 6), rotr_bits(b, 11), rotr_bits(b, 25)))
+
+def gamma0(f, x):
+    b = word_bits(x)
+    return bits_word(xor_bits(f, rotr_bits(b, 7), rotr_bits(b, 18), shr_bits(b, 3)))
+
+def gamma1(f, x):
+    b = word_bits(x)
+    return bits_word(xor_bits(f, rotr_bits(b, 17), rotr_bits(b, 19), shr_bits(b, 10)))
+
+def choose_word(f, x, y, z):
+    xb, yb, zb = word_bits(x), word_bits(y), word_bits(z)
+    return bits_word([f.MUX(xb[i], yb[i], zb[i]) for i in range(32)])
+
+def majority_word(f, x, y, z):
+    xb, yb, zb = word_bits(x), word_bits(y), word_bits(z)
+    return bits_word([f.MAJ(xb[i], yb[i], zb[i]) for i in range(32)])
+
+def sha256_one_block(f, block):
+    """SHA-256 compression of one already padded 64-byte block."""
+    if len(block) != 64:
+        raise ValueError("sha256_one_block requires exactly 64 bytes")
+    w = [int.from_bytes(block[i:i+4], "big") for i in range(0, 64, 4)]
+    for i in range(16, 64):
+        w.append(add_words(f, gamma1(f, w[i-2]), w[i-7], gamma0(f, w[i-15]), w[i-16]))
+    a,b,c,d,e,g,h,j = H0
+    # Name variables correspond to standard a,b,c,d,e,f,g,h (g/h names avoid conflict).
+    ff, gg, hh = g, h, j
+    for i in range(64):
+        t1 = add_words(f, hh, sigma1(f, e), choose_word(f, e, ff, gg), K[i], w[i])
+        t2 = add_words(f, sigma0(f, a), majority_word(f, a, b, c))
+        hh, gg, ff = gg, ff, e
+        e = add_words(f, d, t1)
+        d, c, b = c, b, a
+        a = add_words(f, t1, t2)
+    final = [add_words(f, x, y) for x, y in zip(H0, (a,b,c,d,e,ff,gg,hh))]
+    return b"".join(x.to_bytes(4, "big") for x in final)
+
+def sha256_bytes(f, message):
+    # SHA-256 padding; one or more 512-bit blocks, full standard length encoding.
+    bit_len = len(message) * 8
+    data = message + b"\x80"
+    data += b"\x00" * ((56 - len(data) % 64) % 64)
+    data += bit_len.to_bytes(8, "big")
+    state = H0
+    for off in range(0, len(data), 64):
+        block = data[off:off+64]
+        w = [int.from_bytes(block[i:i+4], "big") for i in range(0, 64, 4)]
+        for i in range(16, 64):
+            w.append(add_words(f, gamma1(f, w[i-2]), w[i-7], gamma0(f, w[i-15]), w[i-16]))
+        a,b,c,d,e,ff,gg,hh = state
+        for i in range(64):
+            t1 = add_words(f, hh, sigma1(f, e), choose_word(f, e, ff, gg), K[i], w[i])
+            t2 = add_words(f, sigma0(f, a), majority_word(f, a, b, c))
+            hh,gg,ff = gg,ff,e
+            e = add_words(f, d, t1)
+            d,c,b = c,b,a
+            a = add_words(f, t1, t2)
+        state = tuple(add_words(f, x, y) for x,y in zip(state, (a,b,c,d,e,ff,gg,hh)))
+    return b"".join(x.to_bytes(4, "big") for x in state)
+
+def mine(f, payload, difficulty, max_nonce):
+    target = "0" * difficulty
+    start = time.perf_counter()
+    for nonce in range(max_nonce + 1):
+        digest = sha256_bytes(f, payload + str(nonce).encode()).hex()
+        if digest.startswith(target):
+            return {
+                "nonce": nonce, "digest": digest, "difficulty_hex_zeros": difficulty,
+                "attempts": nonce + 1, "elapsed_seconds": time.perf_counter()-start,
+                "verified_by_internal_sha256": True
+            }
+    raise RuntimeError("No nonce found. Increase --max-nonce or lower --difficulty.")
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--difficulty", type=int, default=1, help="leading hexadecimal zeroes (default 1; gate-level is slow)")
+    p.add_argument("--max-nonce", type=int, default=100)
+    p.add_argument("--temperature", type=float, default=300.0, help="K")
+    p.add_argument("--path-um", type=float, default=2.0, help="phonon logic path length in micrometres")
+    p.add_argument("--mfp-um", type=float, default=0.3, help="effective phonon mean free path in micrometres")
+    p.add_argument("--gate-energy-attojoule", type=float, default=0.02, help="illustrative energy per logical gate, in aJ")
+    p.add_argument("--output", default="sic_pure_phononic_sha256_results")
+    args = p.parse_args()
+    if not 1 <= args.difficulty <= 4: p.error("--difficulty must be between 1 and 4 for this gate-level demo")
+    fabric = PhononFabric(args.temperature, args.path_um*1e-6, args.mfp_um*1e-6,
+                          args.gate_energy_attojoule*1e-18)
+    payload = b"SiC phononic SHA-256 PoW"
+    result = mine(fabric, payload, args.difficulty, args.max_nonce)
+    # Expected aggregate bit-error estimate for independent gates; it is not sampled
+    # into the ideal logical computation.
+    p_gate = fabric.p_flip
+    p_any = 1.0 - (1.0 - p_gate) ** fabric.logical_gates
+    report = {
+      "experiment": "gate-level ideal Boolean SHA-256 with phonon-transport estimates",
+      "payload": payload.decode(),
+      "pow": result,
+      "phonon_fabric": {
+        "temperature_K": args.temperature, "path_length_m": args.path_um*1e-6,
+        "effective_mean_free_path_m": args.mfp_um*1e-6,
+        "attenuation_exp_minus_L_over_MFP": fabric.attenuation,
+        "gate_energy_J": args.gate_energy_attojoule*1e-18,
+        "gate_error_probability_estimate": p_gate,
+        "estimated_probability_at_least_one_gate_error": p_any,
+        "logical_gate_count": fabric.logical_gates,
+        "gate_counts": fabric.counts,
+        "estimated_total_gate_energy_J": fabric.energy_j,
+        "estimated_total_gate_energy_pJ": fabric.energy_j*1e12,
+        "serial_path_delay_lower_bound_s": fabric.delay_s,
+        "caveat": "Illustrative threshold-margin/noise model, not calibrated SiC data; exact digest is produced by ideal Boolean gate outputs."
+      },
+      "limitations": [
+        "No hashlib or external SHA-256 implementation is used for the mining computation.",
+        "The SHA-256 Boolean network is evaluated in software; it is not physically computed by phonons.",
+        "Transport is represented by attenuation, path delay, and an illustrative thermal error estimate, not a numerical solution of the phonon Boltzmann equation.",
+        "The SHA digest must be independently checked with a trusted implementation before cryptographic use."
+      ]
+    }
+    base = Path(args.output)
+    base.with_suffix(".json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    with base.with_suffix(".txt").open("w", encoding="utf-8") as out:
+        out.write("SiC gate-level phononic SHA-256 PoW simulation\\n")
+        out.write(json.dumps(report, indent=2))
+    print("=== SiC gate-level phononic SHA-256 PoW simulation ===")
+    print("SHA implementation: internal Boolean gate network; no hashlib")
+    print(f"Payload: {payload.decode()}")
+    print(f"Difficulty: {args.difficulty} leading hex zero(s)")
+    print(f"Nonce: {result['nonce']}")
+    print(f"Digest: {result['digest']}")
+    print(f"Attempts: {result['attempts']:,}; elapsed: {result['elapsed_seconds']:.3f} s")
+    print(f"Logical gates: {fabric.logical_gates:,}")
+    print(f"Gate counts: {fabric.counts}")
+    print(f"Phonon attenuation exp(-L/MFP): {fabric.attenuation:.6g}")
+    print(f"Per-gate error estimate: {p_gate:.6g}")
+    print(f"Aggregate at-least-one-error estimate: {p_any:.6g}")
+    print(f"Estimated gate energy: {fabric.energy_j*1e12:.6g} pJ")
+    print(f"Serial path-delay lower bound: {fabric.delay_s:.6g} s")
+    print("Caveat: numerical concept model, not a physical phonon computer.")
+    print(f"Saved {base.with_suffix('.json')} and {base.with_suffix('.txt')}")
+
+if __name__ == "__main__":
+    main()

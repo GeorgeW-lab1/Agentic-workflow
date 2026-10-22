@@ -1,0 +1,296 @@
+// Popup logic - handles service detection and cookie deletion
+let allCookies = [];
+let detectedServices = {};
+let currentDomain = '';
+let suggestedCookies = [];
+
+// Initialize
+document.addEventListener('DOMContentLoaded', init);
+
+async function init() {
+  // Get current tab
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  const tab = tabs[0];
+  
+  // Extract domain
+  const url = new URL(tab.url);
+  currentDomain = url.hostname;
+  document.getElementById('domain').textContent = `Domain: ${currentDomain}`;
+  
+  // Load cookies
+  await loadCookies();
+  
+  // Wait for content script analysis
+  setTimeout(() => {
+    chrome.tabs.sendMessage(tab.id, { action: 'getAnalysis' }, (response) => {
+      if (response && response.detectedServices) {
+        detectedServices = response.detectedServices;
+        displayDetectedServices();
+        identifySuggestedCookies();
+      }
+    }).catch(() => {
+      // Content script might not have run yet, that's okay
+      showStatus('Analyzing page content...', 'info');
+      identifySuggestedCookies();
+    });
+  }, 100);
+  
+  // Setup event listeners
+  document.getElementById('refreshBtn').addEventListener('click', () => {
+    location.reload();
+  });
+  
+  document.getElementById('selectAll').addEventListener('click', selectAllCookies);
+  document.getElementById('deselectAll').addEventListener('click', deselectAllCookies);
+  document.getElementById('deleteSelected').addEventListener('click', deleteSelectedCookies);
+  document.getElementById('deleteDetected').addEventListener('click', deleteDetectedCookies);
+  document.getElementById('searchBox').addEventListener('input', filterAllCookies);
+  
+  // Tab switching
+  document.querySelectorAll('.tab').forEach(tab => {
+    tab.addEventListener('click', switchTab);
+  });
+}
+
+function switchTab(e) {
+  const tabName = e.target.dataset.tab;
+  
+  // Update active tab
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  e.target.classList.add('active');
+  
+  // Update active content
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+  document.getElementById(tabName).classList.add('active');
+}
+
+async function loadCookies() {
+  try {
+    allCookies = await chrome.cookies.getAll({ url: `https://${currentDomain}` });
+    
+    // Also get http version
+    const httpCookies = await chrome.cookies.getAll({ url: `http://${currentDomain}` });
+    allCookies = [...new Map([...allCookies, ...httpCookies].map(c => [c.name, c])).values()];
+    
+    displayAllCookies(allCookies);
+    updateStats();
+  } catch (error) {
+    showStatus('Error loading cookies: ' + error.message, 'error');
+  }
+}
+
+function displayDetectedServices() {
+  const container = document.getElementById('detectedServices');
+  
+  if (Object.keys(detectedServices).length === 0) {
+    container.innerHTML = '<div class="empty-services">No known services detected</div>';
+    return;
+  }
+  
+  const badges = Object.entries(detectedServices).map(([service, data]) => {
+    const confidenceClass = data.confidence === 'high' ? 'high-confidence' : 'medium-confidence';
+    return `<div class="service-badge ${confidenceClass}">${service.toUpperCase()}</div>`;
+  }).join('');
+  
+  container.innerHTML = badges;
+}
+
+function identifySuggestedCookies() {
+  suggestedCookies = [];
+  
+  // Collect all cookies that match detected services
+  for (const [service, data] of Object.entries(detectedServices)) {
+    for (const cookie of allCookies) {
+      if (data.cookies.some(cn => cookie.name.includes(cn) || cn.includes(cookie.name))) {
+        if (!suggestedCookies.find(c => c.name === cookie.name)) {
+          suggestedCookies.push({
+            ...cookie,
+            reason: service.toUpperCase()
+          });
+        }
+      }
+    }
+  }
+  
+  displaySuggestedCookies();
+}
+
+function displaySuggestedCookies() {
+  const list = document.getElementById('suggestedList');
+  
+  if (suggestedCookies.length === 0) {
+    list.innerHTML = '<div class="empty-state">No suspicious cookies detected on this page</div>';
+    document.getElementById('statsDetected').textContent = 'Ready for deletion: 0 cookies';
+    return;
+  }
+  
+  list.innerHTML = suggestedCookies.map((cookie, index) => {
+    const truncatedValue = cookie.value.substring(0, 30) + (cookie.value.length > 30 ? '...' : '');
+    return `
+      <div class="cookie-item">
+        <input type="checkbox" class="suggested-checkbox" data-index="${index}" checked>
+        <div class="cookie-info">
+          <div class="cookie-name">${escapeHtml(cookie.name)}</div>
+          <div class="cookie-reason">From: ${cookie.reason}</div>
+          <div class="cookie-value">${escapeHtml(truncatedValue)}</div>
+        </div>
+      </div>
+    `;
+  }).join('');
+  
+  document.getElementById('statsDetected').textContent = `Ready for deletion: ${suggestedCookies.length} cookies`;
+}
+
+function displayAllCookies(cookies) {
+  const list = document.getElementById('allList');
+  
+  if (cookies.length === 0) {
+    list.innerHTML = '<div class="empty-state">No cookies found</div>';
+    return;
+  }
+  
+  list.innerHTML = cookies.map((cookie, index) => {
+    const truncatedValue = cookie.value.substring(0, 30) + (cookie.value.length > 30 ? '...' : '');
+    const isDetected = suggestedCookies.some(sc => sc.name === cookie.name);
+    const checked = isDetected ? 'checked' : '';
+    
+    return `
+      <div class="cookie-item">
+        <input type="checkbox" class="all-checkbox" data-index="${index}" ${checked}>
+        <div class="cookie-info">
+          <div class="cookie-name">${escapeHtml(cookie.name)}</div>
+          ${isDetected ? `<div class="cookie-reason">🎯 Detected as suspicious</div>` : ''}
+          <div class="cookie-value">${escapeHtml(truncatedValue)}</div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function filterAllCookies() {
+  const searchTerm = document.getElementById('searchBox').value.toLowerCase();
+  const filtered = allCookies.filter(cookie =>
+    cookie.name.toLowerCase().includes(searchTerm) ||
+    cookie.value.toLowerCase().includes(searchTerm)
+  );
+  displayAllCookies(filtered);
+}
+
+function selectAllCookies() {
+  document.querySelectorAll('.all-checkbox').forEach(cb => cb.checked = true);
+}
+
+function deselectAllCookies() {
+  document.querySelectorAll('.all-checkbox').forEach(cb => cb.checked = false);
+}
+
+async function deleteDetectedCookies() {
+  const checkboxes = document.querySelectorAll('.suggested-checkbox:checked');
+  if (checkboxes.length === 0) {
+    showStatus('No cookies selected', 'error');
+    return;
+  }
+  
+  if (!confirm(`Delete ${checkboxes.length} suspicious cookie(s)?`)) return;
+  
+  try {
+    let deleted = 0;
+    
+    for (const checkbox of checkboxes) {
+      const index = parseInt(checkbox.dataset.index);
+      const cookie = suggestedCookies[index];
+      
+      try {
+        await chrome.cookies.remove({
+          url: `https://${currentDomain}${cookie.path}`,
+          name: cookie.name
+        }).catch(() =>
+          chrome.cookies.remove({
+            url: `http://${currentDomain}${cookie.path}`,
+            name: cookie.name
+          })
+        );
+        deleted++;
+      } catch (e) {
+        console.error(`Failed to delete ${cookie.name}:`, e);
+      }
+    }
+    
+    showStatus(`Deleted ${deleted} cookie(s) from detected services`, 'success');
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    location.reload();
+  } catch (error) {
+    showStatus('Error deleting cookies: ' + error.message, 'error');
+  }
+}
+
+async function deleteSelectedCookies() {
+  const checkboxes = document.querySelectorAll('.all-checkbox:checked');
+  if (checkboxes.length === 0) {
+    showStatus('No cookies selected', 'error');
+    return;
+  }
+  
+  if (!confirm(`Delete ${checkboxes.length} cookie(s)?`)) return;
+  
+  try {
+    let deleted = 0;
+    
+    for (const checkbox of checkboxes) {
+      const index = parseInt(checkbox.dataset.index);
+      const cookie = allCookies[index];
+      
+      try {
+        await chrome.cookies.remove({
+          url: `https://${currentDomain}${cookie.path}`,
+          name: cookie.name
+        }).catch(() =>
+          chrome.cookies.remove({
+            url: `http://${currentDomain}${cookie.path}`,
+            name: cookie.name
+          })
+        );
+        deleted++;
+      } catch (e) {
+        console.error(`Failed to delete ${cookie.name}:`, e);
+      }
+    }
+    
+    showStatus(`Successfully deleted ${deleted} cookie(s)`, 'success');
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    location.reload();
+  } catch (error) {
+    showStatus('Error deleting cookies: ' + error.message, 'error');
+  }
+}
+
+function updateStats() {
+  document.getElementById('statsAll').textContent = `Total cookies: ${allCookies.length}`;
+}
+
+function showStatus(message, type) {
+  const statusDiv = document.getElementById('status');
+  statusDiv.textContent = message;
+  statusDiv.className = `status ${type}`;
+  
+  if (type === 'success') {
+    setTimeout(() => {
+      statusDiv.className = 'status';
+    }, 3000);
+  }
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+// Listen for messages from content script
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.action === 'getAnalysis') {
+    sendResponse({
+      detectedServices: detectedServices
+    });
+  }
+});

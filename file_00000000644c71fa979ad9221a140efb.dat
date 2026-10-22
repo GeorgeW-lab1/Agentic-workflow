@@ -1,0 +1,413 @@
+import re
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+
+class Vocab:
+    def __init__(self, words):
+        self.word2idx = {}
+        self.idx2word = []
+        for w in words:
+            if w not in self.word2idx:
+                self.word2idx[w] = len(self.idx2word)
+                self.idx2word.append(w)
+
+    def __len__(self):
+        return len(self.idx2word)
+
+    def encode(self, words):
+        return [self.word2idx[w] for w in words if w in self.word2idx]
+
+    def decode(self, ids):
+        return " ".join(self.idx2word[i] for i in ids if 0 <= i < len(self.idx2word))
+
+
+class NGramDataset(Dataset):
+    def __init__(self, file_path, n=5):
+        text = open(file_path, "r", encoding="utf-8").read().lower()
+        words = text.split()
+
+        self.vocab = Vocab(words)
+        self.n = n
+
+        ids = self.vocab.encode(words)
+        if len(ids) < n + 1:
+            raise ValueError("Corpus too small for given n")
+
+        self.data = [(ids[i:i + n], ids[i + n]) for i in range(len(ids) - n)]
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        x, y = self.data[idx]
+        return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
+
+
+def collate(batch):
+    x = torch.stack([b[0] for b in batch])
+    y = torch.stack([b[1] for b in batch])
+    return x, y
+
+
+class NGramModel(nn.Module):
+    def __init__(self, vocab_size, n=5, d=128):
+        super().__init__()
+        self.n = n
+        self.emb = nn.Embedding(vocab_size, d)
+        self.fc1 = nn.Linear(n * d, 256)
+        self.fc2 = nn.Linear(256, vocab_size)
+
+    def forward(self, x):
+        e = self.emb(x)
+        e = e.reshape(x.size(0), -1)
+        h = F.relu(self.fc1(e))
+        return self.fc2(h)
+
+
+class SemanticBindingProcessor:
+    def __init__(self, vocab, bindings=None, strength=1.0):
+        self.vocab = vocab
+        self.bindings = bindings or {}
+        self.strength = strength
+
+    def update(self, bindings):
+        self.bindings = bindings or {}
+
+    def __call__(self, logits):
+        if not self.bindings:
+            return logits
+        logits = logits.clone()
+        for phrase, boost in self.bindings.items():
+            tokens = re.sub(r"[^\w\s]", "", phrase.lower()).split()
+            for token in tokens:
+                if token in self.vocab.word2idx:
+                    logits[:, self.vocab.word2idx[token]] += float(boost) * self.strength
+        return logits
+
+
+class IsomorphismLogitsProcessor:
+    def __init__(self, target_mass=0.5):
+        self.target_mass = target_mass
+
+    def __call__(self, logits):
+        logits = logits.clone()
+        probs = F.softmax(logits, dim=-1)
+        half = logits.size(-1) // 2
+        mass = probs[:, :half].sum(dim=-1, keepdim=True)
+        diff = mass - self.target_mass
+        if diff.abs().max() > 1e-3:
+            logits[:, :half] -= diff * 1.5
+        return logits
+
+
+class BenchmarkLogitsProcessor:
+    def __init__(self, token_loss_map=None, alpha=0.1, max_boost=5.0):
+        self.token_loss_map = token_loss_map or {}
+        self.alpha = alpha
+        self.max_boost = max_boost
+
+    def update(self, token_loss_map):
+        self.token_loss_map = token_loss_map or {}
+
+    def __call__(self, logits):
+        if not self.token_loss_map:
+            return logits
+        logits = logits.clone()
+        for vocab_id, loss in self.token_loss_map.items():
+            if 0 <= vocab_id < logits.size(-1):
+                boost = min(loss * self.alpha, self.max_boost)
+                logits[:, vocab_id] += boost
+        return logits
+
+
+class StreakTracker:
+    def __init__(self, threshold=0.15, alpha=0.018, max_streak=8, enabled=True):
+        self.threshold = threshold
+        self.alpha = alpha
+        self.max_streak = max_streak
+        self.enabled = enabled
+        self.streak = 0
+
+    def reset(self):
+        self.streak = 0
+
+    def __call__(self, logits):
+        if not self.enabled:
+            return logits
+        logits = logits.clone()
+        probs = F.softmax(logits, dim=-1)
+        top_prob = probs.max(dim=-1).values.item()
+        if top_prob >= self.threshold:
+            self.streak = min(self.streak + 1, self.max_streak)
+        else:
+            self.streak = 0
+        if self.streak > 0:
+            logits = logits * (1.0 + self.streak * self.alpha)
+        return logits
+
+    @property
+    def status(self):
+        bar = "█" * self.streak + "░" * (self.max_streak - self.streak)
+        return f"streak [{bar}] {self.streak}/{self.max_streak}"
+
+
+class StreamMixer:
+    def __init__(self, base_weight=1.0, semantic_weight=0.5, bench_weight=0.5, control_weight=0.2):
+        self.base_weight = base_weight
+        self.semantic_weight = semantic_weight
+        self.bench_weight = bench_weight
+        self.control_weight = control_weight
+
+    def __call__(self, base_logits, semantic_logits=None, bench_logits=None, control_logits=None):
+        out = self.base_weight * base_logits
+        if semantic_logits is not None:
+            out = out + self.semantic_weight * semantic_logits
+        if bench_logits is not None:
+            out = out + self.bench_weight * bench_logits
+        if control_logits is not None:
+            out = out + self.control_weight * control_logits
+        return out
+
+
+class TestBenchmark:
+    def __init__(self, qa_pairs, vocab, n):
+        self.qa_pairs = qa_pairs
+        self.vocab = vocab
+        self.n = n
+
+    @torch.no_grad()
+    def evaluate(self, model, device, epoch):
+        model.eval()
+        all_token_losses = []
+        token_loss_map = {}
+
+        for q_str, a_str in self.qa_pairs:
+            q_ids = self.vocab.encode(re.sub(r"[^\w\s]", "", q_str.lower()).split())
+            if len(q_ids) < self.n:
+                q_ids = [0] * (self.n - len(q_ids)) + q_ids
+
+            a_ids = self.vocab.encode(re.sub(r"[^\w\s]", "", a_str.lower()).split())
+            if not a_ids:
+                continue
+
+            context = q_ids[-self.n:]
+            for target_id in a_ids:
+                x = torch.tensor(context, dtype=torch.long, device=device).unsqueeze(0)
+                logits = model(x)
+                target = torch.tensor([target_id], dtype=torch.long, device=device)
+                loss = F.cross_entropy(logits, target).item()
+                all_token_losses.append(loss)
+                token_loss_map[target_id] = token_loss_map.get(target_id, 0.0) + loss
+                context = (context + [target_id])[-self.n:]
+
+        model.train()
+        return all_token_losses, token_loss_map
+
+
+class SuperProbMiniGenerators:
+    def __init__(self, vocab_size, n=5, base_d=128, num_mini_generators=5):
+        self.vocab_size = vocab_size
+        self.n = n
+        self.base_d = base_d
+        self.num_mini_generators = num_mini_generators
+        self.mini_generators = []
+        for i in range(num_mini_generators):
+            mini = NGramModel(vocab_size, n, d=base_d)
+            self._random_init(mini, seed=i)
+            self.mini_generators.append(mini)
+        self.generator_weights = torch.ones(num_mini_generators) / num_mini_generators
+        self.super_temperature = 1.0
+
+    def _random_init(self, model, seed):
+        torch.manual_seed(seed)
+        for param in model.parameters():
+            param.data = torch.randn_like(param) * 0.1
+
+    def set_generator_weight(self, generator_idx, weight):
+        self.generator_weights[generator_idx] = weight
+
+    def set_super_temperature(self, temp):
+        self.super_temperature = temp
+
+    @torch.no_grad()
+    def get_super_probs(self, context_tensor, device):
+        all_probs = []
+        for mini in self.mini_generators:
+            mini.eval()
+            logits = mini(context_tensor)
+            probs = F.softmax(logits, dim=-1)
+            all_probs.append(probs[0])
+        weights = F.softmax(self.generator_weights, dim=-1).to(device)
+        super_probs = torch.zeros(self.vocab_size, device=device)
+        for i, probs in enumerate(all_probs):
+            super_probs += weights[i] * probs
+        super_probs = super_probs / self.super_temperature
+        super_probs = F.softmax(super_probs, dim=-1)
+        return super_probs, all_probs
+
+
+def train(model, loader, opt, device):
+    model.train()
+    total_loss = 0.0
+    for step, (x, y) in enumerate(loader):
+        x, y = x.to(device), y.to(device)
+        logits = model(x)
+        ce_loss = F.cross_entropy(logits, y)
+        probs = F.softmax(logits, dim=-1)
+        entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1).mean()
+        loss = ce_loss - 0.001 * entropy
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        total_loss += loss.item()
+    return total_loss / max(1, len(loader))
+
+
+@torch.no_grad()
+def generate(
+    model,
+    vocab,
+    prompt,
+    device,
+    iso_processor,
+    bench_processor,
+    streak_tracker,
+    semantic_processor=None,
+    mixer=None,
+    super_gen=None,
+    use_super_probs=False,
+    max_len=300,
+):
+    model.eval()
+    streak_tracker.reset()
+
+    words = re.sub(r"[^\w\s]", "", prompt.lower()).split()
+    ids = vocab.encode(words)
+    if len(ids) < model.n:
+        ids = [0] * (model.n - len(ids)) + ids
+
+    for _ in range(max_len):
+        context = ids[-model.n:]
+        x = torch.tensor(context, dtype=torch.long, device=device).unsqueeze(0)
+
+        if use_super_probs and super_gen is not None:
+            base_probs, _ = super_gen.get_super_probs(x, device)
+            base_logits = torch.log(base_probs.clamp_min(1e-12)).unsqueeze(0)
+        else:
+            base_logits = model(x)
+
+        semantic_logits = semantic_processor(base_logits) if semantic_processor is not None else None
+        bench_logits = bench_processor(base_logits)
+        control_logits = streak_tracker(base_logits)
+
+        if mixer is None:
+            logits = base_logits
+            logits = iso_processor(logits)
+            logits = bench_processor(logits)
+            logits = streak_tracker(logits)
+            if semantic_processor is not None:
+                logits = semantic_processor(logits)
+        else:
+            logits = mixer(
+                base_logits=base_logits,
+                semantic_logits=semantic_logits,
+                bench_logits=bench_logits,
+                control_logits=control_logits,
+            )
+            logits = iso_processor(logits)
+
+        probs = F.softmax(logits, dim=-1)
+        next_id = torch.multinomial(probs, 1).item()
+        ids.append(next_id)
+
+    return vocab.decode(ids)
+
+
+def default_semantic_bindings():
+    return {
+        "prime numbers": 3.0,
+        "polymorphisms": -1.0,
+        "hallucination": 2.0,
+        "memory": 1.5,
+        "reward function": 2.5,
+    }
+
+
+def main(txt_path="corpus.txt", n=5):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    dataset = NGramDataset(txt_path, n=n)
+    loader = DataLoader(dataset, batch_size=64, shuffle=False, collate_fn=collate)
+
+    model = NGramModel(len(dataset.vocab), n=n).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+    qa_pairs = [
+        ("what is the meaning of", "life is a journey full of purpose"),
+        ("the quick brown fox", "jumps over the lazy dog"),
+        ("to be or not to", "be that is the question"),
+    ]
+
+    benchmark = TestBenchmark(qa_pairs, vocab=dataset.vocab, n=n)
+    bench_processor = BenchmarkLogitsProcessor({}, alpha=8e-12, max_boost=1.0)
+    iso_processor = IsomorphismLogitsProcessor(target_mass=8e-12)
+    streak_tracker = StreakTracker(threshold=8e-12, alpha=8e-12, max_streak=118, enabled=False)
+
+    semantic_processor = SemanticBindingProcessor(
+        vocab=dataset.vocab,
+        bindings=default_semantic_bindings(),
+        strength=1.0,
+    )
+
+    mixer = StreamMixer(
+        base_weight=1.0,
+        semantic_weight=0.35,
+        bench_weight=0.25,
+        control_weight=0.15,
+    )
+
+    super_gen = SuperProbMiniGenerators(
+        vocab_size=len(dataset.vocab),
+        n=n,
+        base_d=128,
+        num_mini_generators=5,
+    )
+    super_gen.set_super_temperature(8e-12)
+
+    print("Training base n-gram model...")
+    for epoch in range(2):
+        loss = train(model, loader, opt, device)
+        print(f"Epoch {epoch} | train loss {loss:.4f}")
+        _, token_loss_map = benchmark.evaluate(model, device, epoch)
+        bench_processor.update(token_loss_map)
+
+    print("Generating...")
+    while True:
+        user_input = input("USER: ")
+        use_super = "--super" in user_input
+        user_input = user_input.replace("--super", "").strip()
+
+        output = generate(
+            model=model,
+            vocab=dataset.vocab,
+            prompt=user_input,
+            device=device,
+            iso_processor=iso_processor,
+            bench_processor=bench_processor,
+            streak_tracker=streak_tracker,
+            semantic_processor=semantic_processor,
+            mixer=mixer,
+            super_gen=super_gen,
+            use_super_probs=use_super,
+            max_len=300,
+        )
+        print(output)
+        print()
+
+
+if __name__ == "__main__":
+    filepath = input("Filename: ")
+    main(filepath, n=3)

@@ -1,0 +1,1314 @@
+#!/usr/bin/env python3
+"""
+TOY SHA-256 INTERFERENCE HARDWARE
+
+Maps a scalable N x N equal-amplitude optical search plane onto a
+toy SHA-like hash / phase-interference / Grover simulation.
+
+Scaling convention:
+
+    8   x 8    ->  8-bit hash
+    16  x 16   -> 16-bit hash
+    32  x 32   -> 32-bit hash
+    ...
+    256 x 256  -> 256-bit hash
+
+IMPORTANT:
+    This is a numerical optical model, not a physical implementation
+    of cryptographic SHA-256.
+
+The initial optical amplitudes are ALWAYS identical:
+
+    psi[i,j] = 1/N
+
+for an N x N plane, giving normalized total intensity:
+
+    N^2 * (1/N)^2 = 1
+
+The hash comparison produces a phase mask:
+
+    non-match -> +1
+    match     -> -1
+
+The Grover-style diffusion is then modeled as interference around
+the mean field.
+
+The supplied hardware model used:
+    - binary same-plane valve encoding
+    - FFT interference
+    - balanced power
+    - cross-correlation
+
+This version preserves those concepts while removing random candidate
+amplitudes and making the optical plane/hash width scalable.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import math
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+np.set_printoptions(precision=4, suppress=True)
+
+
+# ======================================================================
+# SCALABLE TOY HASH
+# ======================================================================
+
+def mask_for_bits(bits: int) -> int:
+    if bits < 1:
+        raise ValueError("bits must be >= 1")
+    return (1 << bits) - 1
+
+
+def rotl(x: int, n: int, bits: int) -> int:
+    mask = mask_for_bits(bits)
+    n %= bits
+    x &= mask
+    if n == 0:
+        return x
+    return ((x << n) | (x >> (bits - n))) & mask
+
+
+def rotr(x: int, n: int, bits: int) -> int:
+    mask = mask_for_bits(bits)
+    n %= bits
+    x &= mask
+    if n == 0:
+        return x
+    return ((x >> n) | (x << (bits - n))) & mask
+
+
+def toy_sha_variable(x: int, bits: int) -> int:
+    """
+    Deterministic SHA-like toy hash.
+
+    It is intentionally NOT cryptographic SHA-256.
+
+    The output width equals `bits`.
+
+    For demonstration:
+        8-bit input/search plane  -> 8-bit digest
+        16-bit plane              -> 16-bit digest
+        ...
+        256-bit plane             -> 256-bit digest
+    """
+
+    mask = mask_for_bits(bits)
+    x &= mask
+
+    # Four SHA-like state words represented at the selected width.
+    a = 0x6A09E667 & mask
+    b = 0xBB67AE85 & mask
+    c = 0x3C6EF372 & mask
+    d = 0xA54FF53A & mask
+
+    # Message-derived words.
+    w0 = x
+    w1 = rotl(x ^ 0x36, 1, bits)
+    w2 = rotr(x ^ 0xA5, 3, bits)
+    w3 = (x + 0x5A) & mask
+
+    rounds = max(8, bits // 4)
+
+    for r in range(rounds):
+
+        k = (
+            0x9E3779B97F4A7C15
+            * (r + 1)
+        ) & mask
+
+        if r & 1:
+            # Majority-like branch.
+            maj = (
+                (a & b)
+                ^ (a & c)
+                ^ (b & c)
+            ) & mask
+
+            s1 = rotr(c, 7, bits)
+            t1 = (
+                d
+                + s1
+                + maj
+                + w1
+                + k
+            ) & mask
+
+            t2 = (
+                rotl(b, 3, bits)
+                ^ rotr(d, 2, bits)
+            ) & mask
+
+        else:
+            # Choice-like branch.
+            ch = (
+                (b & c)
+                ^ ((~b) & d)
+            ) & mask
+
+            s1 = rotr(b, 5, bits)
+
+            t1 = (
+                a
+                + s1
+                + ch
+                + w0
+                + k
+            ) & mask
+
+            t2 = (
+                rotr(a, 2, bits)
+                ^ rotl(c, 3, bits)
+            ) & mask
+
+        new_d = c
+        new_c = b
+        new_b = (a + t2) & mask
+        new_a = (t1 + t2) & mask
+
+        a, b, c, d = new_a, new_b, new_c, new_d
+
+        w0, w1, w2, w3 = (
+            w1,
+            w2,
+            w3,
+            (
+                w0
+                ^ rotl(w1, 1, bits)
+                ^ rotr(w2, 2, bits)
+                ^ k
+            ) & mask,
+        )
+
+    digest = (
+        a
+        ^ rotl(b, 1, bits)
+        ^ rotr(c, 2, bits)
+        ^ rotl(d, 3, bits)
+    ) & mask
+
+    return digest
+
+
+# ======================================================================
+# OPTIONAL REAL SHA-256 REFERENCE
+# ======================================================================
+
+def sha256_bits(x: int, input_bits: int = 8) -> int:
+    """
+    Real SHA-256 reference for small demonstration inputs.
+
+    This is only a reference and does not make the optical hardware
+    itself compute SHA-256.
+    """
+
+    byte_count = max(1, (input_bits + 7) // 8)
+
+    data = x.to_bytes(byte_count, "big")
+
+    digest = hashlib.sha256(data).digest()
+
+    return int.from_bytes(digest, "big")
+
+
+# ======================================================================
+# EQUAL-AMPLITUDE OPTICAL SEARCH PLANE
+# ======================================================================
+
+def make_equal_amplitude_field(N: int) -> np.ndarray:
+    """
+    N x N spatial modes.
+
+    Every spatial cell has exactly the same amplitude:
+
+        1/N
+
+    Total normalized intensity is exactly 1.
+    """
+
+    if N < 1:
+        raise ValueError("N must be >= 1")
+
+    field = np.full(
+        (N, N),
+        1.0 / N,
+        dtype=complex,
+    )
+
+    return field
+
+
+def field_norm(field: np.ndarray) -> float:
+    return float(np.sum(np.abs(field) ** 2))
+
+
+# ======================================================================
+# BINARY SAME-PLANE HARDWARE
+# ======================================================================
+
+def build_binary_filter(
+    rows: int,
+    cols: int,
+    seed: int,
+    p_open: float = 0.5,
+) -> np.ndarray:
+
+    rng = np.random.default_rng(seed)
+
+    return (
+        rng.uniform(0.0, 1.0, (rows, cols))
+        < p_open
+    ).astype(float)
+
+
+def encode_same_plane(
+    values: np.ndarray,
+    valves: np.ndarray,
+) -> np.ndarray:
+
+    if values.shape != valves.shape:
+        raise ValueError(
+            "values and valves must have identical shapes"
+        )
+
+    if not np.all(np.isin(valves, [0.0, 1.0])):
+        raise ValueError(
+            "valves must be strictly binary"
+        )
+
+    return values * valves
+
+
+# ======================================================================
+# PHASE PLANE
+# ======================================================================
+
+def apply_phase_plane(
+    field: np.ndarray,
+    phase: np.ndarray,
+) -> np.ndarray:
+
+    if field.shape != phase.shape:
+        raise ValueError(
+            "field and phase must have identical shapes"
+        )
+
+    return field * phase
+
+
+# ======================================================================
+# FFT INTERFERENCE
+# ======================================================================
+
+def fft2c(x: np.ndarray) -> np.ndarray:
+    return np.fft.fftshift(
+        np.fft.fft2(
+            np.fft.ifftshift(x)
+        )
+    )
+
+
+def ifft2c(x: np.ndarray) -> np.ndarray:
+    return np.fft.fftshift(
+        np.fft.ifft2(
+            np.fft.ifftshift(x)
+        )
+    )
+
+
+def balanced_interference(
+    A: np.ndarray,
+    B: np.ndarray,
+):
+    """
+    Optical interference diagnostic:
+
+        |F(A+B)|² - |F(A)|² - |F(B)|²
+
+    isolates the cross/interference contribution.
+    """
+
+    F_A = fft2c(A)
+    F_B = fft2c(B)
+
+    joint_power = np.abs(F_A + F_B) ** 2
+
+    self_power = (
+        np.abs(F_A) ** 2
+        + np.abs(F_B) ** 2
+    )
+
+    balanced_power = joint_power - self_power
+
+    cross_spectrum = (
+        F_A * np.conj(F_B)
+        + np.conj(F_A) * F_B
+    )
+
+    cross_correlation = np.real(
+        ifft2c(cross_spectrum)
+    )
+
+    return (
+        joint_power,
+        balanced_power,
+        cross_correlation,
+    )
+
+
+# ======================================================================
+# BIT PLANES
+# ======================================================================
+
+def integer_to_bits(
+    value: int,
+    bits: int,
+) -> np.ndarray:
+
+    return np.array(
+        [
+            (value >> b) & 1
+            for b in range(bits)
+        ],
+        dtype=np.uint8,
+    )
+
+
+def build_candidate_bit_planes(
+    N: int,
+) -> np.ndarray:
+    """
+    N x N spatial candidate plane.
+
+    Candidate count = N².
+
+    Returns:
+        [candidate, bit]
+    """
+
+    candidates = N * N
+
+    planes = np.zeros(
+        (candidates, N),
+        dtype=np.uint8,
+    )
+
+    for candidate in range(candidates):
+        planes[candidate] = integer_to_bits(
+            candidate,
+            N,
+        )
+
+    return planes
+
+
+def build_hash_bit_planes(
+    N: int,
+) -> np.ndarray:
+    """
+    Calculate the toy hash for every spatial candidate.
+
+    Returns:
+        [candidate, hash_bit]
+
+    This is a SOFTWARE reference representation of the optical
+    bit-plane decomposition.
+    """
+
+    candidates = N * N
+
+    planes = np.zeros(
+        (candidates, N),
+        dtype=np.uint8,
+    )
+
+    for candidate in range(candidates):
+
+        digest = toy_sha_variable(
+            candidate,
+            N,
+        )
+
+        planes[candidate] = integer_to_bits(
+            digest,
+            N,
+        )
+
+    return planes
+
+
+# ======================================================================
+# TARGET COMPARATOR
+# ======================================================================
+
+def build_target_comparison(
+    N: int,
+    target: int,
+):
+    """
+    Compare H(x) against target.
+
+    The phase mask is:
+
+        +1 -> non-match
+        -1 -> match
+
+    This phase mask is the lossless oracle representation.
+    """
+
+    candidates = N * N
+    mask = mask_for_bits(N)
+
+    target &= mask
+
+    hashes = np.empty(
+        candidates,
+        dtype=object,
+    )
+
+    matches = np.zeros(
+        candidates,
+        dtype=bool,
+    )
+
+    xor_values = np.empty(
+        candidates,
+        dtype=object,
+    )
+
+    phase = np.ones(
+        candidates,
+        dtype=complex,
+    )
+
+    for x in range(candidates):
+
+        h = toy_sha_variable(
+            x,
+            N,
+        )
+
+        hashes[x] = h
+
+        difference = h ^ target
+
+        xor_values[x] = difference
+
+        if difference == 0:
+            matches[x] = True
+            phase[x] = -1.0
+
+    return (
+        hashes,
+        xor_values,
+        matches,
+        phase,
+    )
+
+
+# ======================================================================
+# GROVER INTERFERENCE
+# ======================================================================
+
+def diffusion_1d(
+    state: np.ndarray,
+) -> np.ndarray:
+
+    mean = np.mean(state)
+
+    return (
+        2.0 * mean
+        - state
+    )
+
+
+def diffusion_2d(
+    field: np.ndarray,
+) -> np.ndarray:
+
+    mean = np.mean(field)
+
+    return (
+        2.0 * mean
+        - field
+    )
+
+
+def optical_grover(
+    N: int,
+    target: int,
+    iterations: int | None = None,
+):
+    """
+    Equal-amplitude N x N optical Grover search.
+
+    Candidate x is mapped to:
+
+        row = x // N
+        col = x % N
+
+    The initial state has exactly equal amplitude in every cell.
+    """
+
+    candidates = N * N
+
+    (
+        hashes,
+        xor_values,
+        matches,
+        phase,
+    ) = build_target_comparison(
+        N,
+        target,
+    )
+
+    marked_count = int(matches.sum())
+
+    if marked_count == 0:
+        raise RuntimeError(
+            "Target has no preimage in the selected N² search space."
+        )
+
+    if iterations is None:
+        iterations = max(
+            1,
+            int(
+                round(
+                    (math.pi / 4.0)
+                    * math.sqrt(
+                        candidates / marked_count
+                    )
+                )
+            ),
+        )
+
+    state = make_equal_amplitude_field(N)
+
+    initial_norm = field_norm(state)
+
+    phase_2d = phase.reshape(N, N)
+
+    history = []
+
+    for iteration in range(iterations):
+
+        # ----------------------------------------------------------
+        # PHASE ORACLE
+        #
+        # Matching spatial cells receive a pi phase shift.
+        # No amplitude is removed.
+        # ----------------------------------------------------------
+
+        state = apply_phase_plane(
+            state,
+            phase_2d,
+        )
+
+        # ----------------------------------------------------------
+        # INTERFERENCE / DIFFUSION
+        # ----------------------------------------------------------
+
+        state = diffusion_2d(state)
+
+        probability = np.abs(state) ** 2
+
+        solution_probability = float(
+            probability.reshape(-1)[matches].sum()
+        )
+
+        history.append(
+            solution_probability
+        )
+
+    probability = np.abs(state) ** 2
+
+    best = int(
+        np.argmax(
+            probability.reshape(-1)
+        )
+    )
+
+    final_norm = field_norm(state)
+
+    return {
+        "state": state,
+        "probability": probability,
+        "hashes": hashes,
+        "xor_values": xor_values,
+        "matches": matches,
+        "phase": phase,
+        "history": history,
+        "iterations": iterations,
+        "marked_count": marked_count,
+        "best": best,
+        "initial_norm": initial_norm,
+        "final_norm": final_norm,
+    }
+
+
+# ======================================================================
+# VISUALIZATION
+# ======================================================================
+
+def plot_matrix(
+    ax,
+    data,
+    title,
+    cmap="viridis",
+    annotate=False,
+):
+    image = ax.imshow(
+        data,
+        origin="lower",
+        interpolation="nearest",
+        aspect="auto",
+        cmap=cmap,
+    )
+
+    ax.set_title(title)
+    ax.set_xlabel("column")
+    ax.set_ylabel("row")
+
+    if annotate and data.shape[0] <= 16:
+
+        for r in range(data.shape[0]):
+            for c in range(data.shape[1]):
+
+                value = data[r, c]
+
+                if np.iscomplexobj(value):
+                    text = f"{value.real:.2f}"
+                else:
+                    text = f"{float(value):.2f}"
+
+                ax.text(
+                    c,
+                    r,
+                    text,
+                    ha="center",
+                    va="center",
+                    fontsize=7,
+                )
+
+    return image
+
+
+def make_visualization(
+    N: int,
+    target: int,
+    result: dict,
+    out_path: str,
+):
+    """
+    Generate a hardware-oriented diagnostic figure.
+
+    For large planes the hash planes are downsampled for display only.
+    The underlying computation remains at full N-bit width.
+    """
+
+    candidates = N * N
+
+    candidate_bits = build_candidate_bit_planes(N)
+    hash_bits = build_hash_bit_planes(N)
+
+    matches = result["matches"]
+    probability = result["probability"]
+
+    # ----------------------------------------------------------
+    # Display representations
+    # ----------------------------------------------------------
+
+    candidate_spatial = np.ones(
+        (N, N),
+        dtype=float,
+    )
+
+    match_spatial = matches.reshape(
+        N,
+        N,
+    ).astype(float)
+
+    phase_spatial = (
+        result["phase"]
+        .reshape(N, N)
+        .real
+    )
+
+    # A compact hash visualisation:
+    # each candidate gets its hash as a row.
+    hash_display = hash_bits.astype(float)
+
+    candidate_bit_display = (
+        candidate_bits.astype(float)
+    )
+
+    # ----------------------------------------------------------
+    # Figure
+    # ----------------------------------------------------------
+
+    fig, axes = plt.subplots(
+        3,
+        4,
+        figsize=(18, 13),
+        constrained_layout=True,
+    )
+
+    plot_matrix(
+        axes[0, 0],
+        candidate_spatial,
+        f"{N}×{N} EQUAL-AMPLITUDE FIELD",
+        "Greys",
+    )
+
+    plot_matrix(
+        axes[0, 1],
+        match_spatial,
+        "TARGET MATCH PLANE",
+        "Greys",
+    )
+
+    plot_matrix(
+        axes[0, 2],
+        phase_spatial,
+        "PHASE ORACLE\n+1 / -1",
+        "coolwarm",
+    )
+
+    plot_matrix(
+        axes[0, 3],
+        probability,
+        "FINAL INTERFERENCE PROBABILITY",
+        "inferno",
+    )
+
+    axes[1, 0].imshow(
+        candidate_bit_display,
+        aspect="auto",
+        interpolation="nearest",
+        origin="lower",
+        cmap="Greys",
+    )
+    axes[1, 0].set_title(
+        f"CANDIDATE BITS\n{candidates} × {N}"
+    )
+    axes[1, 0].set_xlabel("bit")
+    axes[1, 0].set_ylabel("candidate")
+
+    axes[1, 1].imshow(
+        hash_display,
+        aspect="auto",
+        interpolation="nearest",
+        origin="lower",
+        cmap="Greys",
+    )
+    axes[1, 1].set_title(
+        f"TOY HASH BIT PLANES\n{candidates} × {N}"
+    )
+    axes[1, 1].set_xlabel("hash bit")
+    axes[1, 1].set_ylabel("candidate")
+
+    # Target XOR magnitude display.
+    xor_numeric = np.array(
+        [
+            int(x)
+            for x in result["xor_values"]
+        ],
+        dtype=object,
+    )
+
+    # Log-like display so high-width XOR values remain visible.
+    xor_log = np.log2(
+        np.asarray(
+            [
+                int(x) + 1
+                for x in xor_numeric
+            ],
+            dtype=float,
+        )
+    )
+
+    axes[1, 2].imshow(
+        xor_log.reshape(N, N),
+        origin="lower",
+        interpolation="nearest",
+        aspect="auto",
+        cmap="inferno",
+    )
+    axes[1, 2].set_title(
+        "HASH XOR TARGET\nlog2(value + 1)"
+    )
+    axes[1, 2].set_xlabel("column")
+    axes[1, 2].set_ylabel("row")
+
+    axes[1, 3].plot(
+        np.arange(
+            1,
+            len(result["history"]) + 1,
+        ),
+        result["history"],
+        marker="o",
+    )
+    axes[1, 3].set_title(
+        "INTERFERENCE AMPLIFICATION"
+    )
+    axes[1, 3].set_xlabel(
+        "Grover iteration"
+    )
+    axes[1, 3].set_ylabel(
+        "P(solution)"
+    )
+    axes[1, 3].grid(True, alpha=0.25)
+
+    # ----------------------------------------------------------
+    # Hardware diagnostic text
+    # ----------------------------------------------------------
+
+    axes[2, 0].axis("off")
+
+    axes[2, 0].text(
+        0.02,
+        0.95,
+        "\n".join(
+            [
+                "OPTICAL ARCHITECTURE",
+                "",
+                f"Plane:             {N} × {N}",
+                f"Candidates:        {candidates:,}",
+                f"Hash width:        {N} bits",
+                f"Initial amplitude: 1/{N}",
+                f"Initial norm:      "
+                f"{result['initial_norm']:.8f}",
+                f"Marked cells:      "
+                f"{result['marked_count']}",
+                f"Grover rounds:     "
+                f"{result['iterations']}",
+                "",
+                "Amplitude: equal",
+                "Oracle:     phase only",
+                "Marked:     π phase",
+                "Amplifier:  interference",
+            ]
+        ),
+        va="top",
+        ha="left",
+        fontsize=12,
+        family="monospace",
+    )
+
+    axes[2, 1].axis("off")
+
+    axes[2, 1].text(
+        0.02,
+        0.95,
+        (
+            "SCALING\n\n"
+            "8×8     → 8-bit\n"
+            "16×16   → 16-bit\n"
+            "32×32   → 32-bit\n"
+            "64×64   → 64-bit\n"
+            "128×128 → 128-bit\n"
+            "256×256 → 256-bit\n\n"
+            "N×N contains N² spatial candidates.\n"
+            "Each candidate carries an N-bit hash."
+        ),
+        va="top",
+        ha="left",
+        fontsize=12,
+        family="monospace",
+    )
+
+    axes[2, 2].axis("off")
+
+    axes[2, 2].text(
+        0.02,
+        0.95,
+        (
+            "PHYSICAL INTERPRETATION\n\n"
+            "Equal coherent illumination\n"
+            "        ↓\n"
+            "Spatial candidate encoding\n"
+            "        ↓\n"
+            "Toy hash transformation\n"
+            "        ↓\n"
+            "256/128/... bit comparison\n"
+            "        ↓\n"
+            "π phase modulation\n"
+            "        ↓\n"
+            "Optical interference\n"
+            "        ↓\n"
+            "Spatial amplification"
+        ),
+        va="top",
+        ha="left",
+        fontsize=12,
+        family="monospace",
+    )
+
+    axes[2, 3].axis("off")
+
+    best = result["best"]
+    best_row = best // N
+    best_col = best % N
+
+    axes[2, 3].text(
+        0.02,
+        0.95,
+        (
+            "MEASUREMENT\n\n"
+            f"Best candidate: {best}\n"
+            f"Position:       ({best_row}, {best_col})\n\n"
+            f"Hash: 0x{int(result['hashes'][best]):X}\n"
+            f"Target: 0x{target:X}\n\n"
+            f"P(best): "
+            f"{result['probability'].reshape(-1)[best]:.8f}\n\n"
+            f"P(all matches): "
+            f"{result['probability'].reshape(-1)[result['matches']].sum():.8f}\n\n"
+            f"Final norm: "
+            f"{result['final_norm']:.8f}"
+        ),
+        va="top",
+        ha="left",
+        fontsize=12,
+        family="monospace",
+    )
+
+    fig.suptitle(
+        (
+            f"EQUAL-AMPLITUDE {N}×{N} OPTICAL PLANE → "
+            f"{N}-BIT TOY HASH → PHASE INTERFERENCE → GROVER"
+        ),
+        fontsize=16,
+    )
+
+    fig.savefig(
+        out_path,
+        dpi=140,
+        bbox_inches="tight",
+    )
+
+    plt.close(fig)
+
+
+# ======================================================================
+# MAIN EXPERIMENT
+# ======================================================================
+
+def run(
+    N: int = 8,
+    secret: int = 37,
+    target: int | None = None,
+    out_path: str | None = None,
+):
+    """
+    Run the scalable experiment.
+
+    Default:
+        N=8
+
+    To run the requested 256x256 / 256-bit configuration:
+
+        python toy_sha256_interference_hardware_full.py --size 256
+
+    WARNING:
+        The full 256-bit hash table is computationally much larger
+        than the 8-bit demonstration. This implementation intentionally
+        keeps the hash computation explicit so the scaling is visible.
+    """
+
+    if N < 2:
+        raise ValueError("N must be >= 2")
+
+    # ----------------------------------------------------------
+    # Candidate count
+    # ----------------------------------------------------------
+
+    candidates = N * N
+
+    max_candidate = candidates - 1
+
+    if secret < 0 or secret > max_candidate:
+        raise ValueError(
+            f"secret must be in [0, {max_candidate}]"
+        )
+
+    if target is None:
+        target = toy_sha_variable(
+            secret,
+            N,
+        )
+    else:
+        target &= mask_for_bits(N)
+
+    # ----------------------------------------------------------
+    # Equal-amplitude field
+    # ----------------------------------------------------------
+
+    field = make_equal_amplitude_field(N)
+
+    # ----------------------------------------------------------
+    # Confirm exact equal amplitude
+    # ----------------------------------------------------------
+
+    amplitudes = np.abs(field)
+
+    amplitude_min = float(amplitudes.min())
+    amplitude_max = float(amplitudes.max())
+
+    # ----------------------------------------------------------
+    # Original hardware-style binary valve demonstration
+    #
+    # This layer is separate from the lossless phase oracle.
+    # ----------------------------------------------------------
+
+    binary_valves = build_binary_filter(
+        N,
+        N,
+        seed=101,
+        p_open=0.5,
+    )
+
+    binary_encoded = encode_same_plane(
+        np.ones((N, N)),
+        binary_valves,
+    )
+
+    # Equal-amplitude field itself is NOT multiplied by these valves
+    # for the Grover state. The valve demonstration is kept separate
+    # because amplitude blocking is not unitary.
+    #
+    # The phase oracle below preserves the full optical norm.
+
+    # ----------------------------------------------------------
+    # Interference diagnostic
+    # ----------------------------------------------------------
+
+    A = field
+    B = np.roll(
+        field,
+        shift=1,
+        axis=1,
+    )
+
+    (
+        joint_power,
+        balanced_power,
+        cross_correlation,
+    ) = balanced_interference(
+        A,
+        B,
+    )
+
+    # ----------------------------------------------------------
+    # Grover / interference
+    # ----------------------------------------------------------
+
+    result = optical_grover(
+        N,
+        target,
+    )
+
+    # ----------------------------------------------------------
+    # Output
+    # ----------------------------------------------------------
+
+    best = result["best"]
+    best_hash = int(result["hashes"][best])
+
+    print()
+    print("=" * 76)
+    print("EQUAL-AMPLITUDE TOY-SHA INTERFERENCE HARDWARE")
+    print("=" * 76)
+
+    print(f"Optical plane:          {N} × {N}")
+    print(f"Spatial candidates:     {candidates:,}")
+    print(f"Hash width:             {N} bits")
+    print(f"Secret candidate:       {secret}")
+    print(f"Target:                 0x{target:X}")
+    print()
+
+    print("INITIAL OPTICAL FIELD")
+    print(
+        f"Amplitude min:          {amplitude_min:.12f}"
+    )
+    print(
+        f"Amplitude max:          {amplitude_max:.12f}"
+    )
+    print(
+        f"Total optical norm:     "
+        f"{field_norm(field):.12f}"
+    )
+    print(
+        f"Amplitude uniform:      "
+        f"{np.isclose(amplitude_min, amplitude_max)}"
+    )
+
+    print()
+    print("BINARY SAME-PLANE VALVE")
+    print(
+        f"Open fraction:           "
+        f"{binary_valves.mean():.4f}"
+    )
+    print(
+        "This layer is amplitude gating only; "
+        "it is not used as the lossless Grover oracle."
+    )
+
+    print()
+    print("INTERFERENCE DIAGNOSTIC")
+    print(
+        f"Balanced power min/max:  "
+        f"{balanced_power.min():.6f} / "
+        f"{balanced_power.max():.6f}"
+    )
+    print(
+        f"Cross-correlation max:   "
+        f"{np.max(np.abs(cross_correlation)):.6f}"
+    )
+
+    print()
+    print("TOY HASH / PHASE ORACLE")
+    print(
+        f"Marked candidates:       "
+        f"{result['marked_count']}"
+    )
+    print(
+        f"Grover iterations:       "
+        f"{result['iterations']}"
+    )
+
+    print()
+    print("MEASUREMENT")
+    print(
+        f"Best candidate:          "
+        f"{best}"
+    )
+    print(
+        f"Best position:           "
+        f"({best // N}, {best % N})"
+    )
+    print(
+        f"Hash(best):              "
+        f"0x{best_hash:X}"
+    )
+    print(
+        f"Target:                  "
+        f"0x{target:X}"
+    )
+    print(
+        f"P(best):                "
+        f"{result['probability'].reshape(-1)[best]:.8f}"
+    )
+    print(
+        f"P(all solutions):        "
+        f"{result['probability'].reshape(-1)[result['matches']].sum():.8f}"
+    )
+
+    print()
+    print("INTERFERENCE TRAJECTORY")
+
+    for i, probability in enumerate(
+        result["history"],
+        start=1,
+    ):
+        print(
+            f"  round {i:3d}: "
+            f"P(solution) = {probability:.8f}"
+        )
+
+    # ----------------------------------------------------------
+    # Visualization
+    # ----------------------------------------------------------
+
+    if out_path is None:
+        out_path = (
+            f"toy_sha_interference_{N}x{N}.png"
+        )
+
+    make_visualization(
+        N,
+        target,
+        result,
+        out_path,
+    )
+
+    print()
+    print(
+        f"Saved visualization:    {out_path}"
+    )
+
+    return {
+        "field": field,
+        "binary_valves": binary_valves,
+        "binary_encoded": binary_encoded,
+        "joint_power": joint_power,
+        "balanced_power": balanced_power,
+        "cross_correlation": cross_correlation,
+        "result": result,
+    }
+
+
+# ======================================================================
+# CLI
+# ======================================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Equal-amplitude scalable toy-SHA optical "
+            "interference/Grover simulation."
+        )
+    )
+
+    parser.add_argument(
+        "--size",
+        type=int,
+        default=8,
+        help=(
+            "N for the N×N optical plane and N-bit hash. "
+            "Examples: 8, 16, 32, 64, 128, 256."
+        ),
+    )
+
+    parser.add_argument(
+        "--secret",
+        type=int,
+        default=37,
+        help="Known toy-hash preimage used to construct the target.",
+    )
+
+    parser.add_argument(
+        "--target",
+        type=lambda x: int(x, 0),
+        default=None,
+        help="Optional target digest, e.g. 0x5A.",
+    )
+
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Output PNG path.",
+    )
+
+    args = parser.parse_args()
+
+    run(
+        N=args.size,
+        secret=args.secret,
+        target=args.target,
+        out_path=args.output,
+    )
+
+
+if __name__ == "__main__":
+    main()

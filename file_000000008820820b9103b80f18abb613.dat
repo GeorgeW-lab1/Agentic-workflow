@@ -1,0 +1,449 @@
+from __future__ import annotations
+
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from multiprocessing import freeze_support
+from typing import Callable, Optional, Sequence
+import random
+import time
+
+"""
+Equation-driven subset-sum solver -- memory/compute-efficient version.
+
+Two changes from the earlier version, both needed once n gets into the
+millions:
+
+1. PATH REPRESENTATION: paths were stored as Python lists and rebuilt with
+   `path + [x]` on every "include" step -- that's an O(depth) copy PER
+   CANDIDATE PER STEP, so total path-copying cost alone is O(width * n^2)
+   in the worst case. Fixed by using an immutable linked-list ("cons cell":
+   (value, parent_node)) instead. Extending a path is now O(1): "exclude"
+   reuses the same node reference, "include" allocates exactly one new
+   node. The full path is only ever materialized once, at the very end,
+   by walking the parent chain of the winning candidate.
+
+2. BEAM WIDTH CAP: n**c is not a usable real-world cap once n is large
+   (2_490_000**2 ~ 6.2e12 -- you cannot materialize trillions of beam
+   candidates). Added an explicit `max_beam_width` that hard-caps memory
+   regardless of what the formula's n^c theoretically allows -- this is
+   the actual, honest cap; n^c was never enforceable as a memory bound.
+
+Also: dedup by partial sum (many different item combinations often land
+on the same partial sum -- no need to keep more than one path per sum),
+and use heapq.nsmallest instead of a full sort to pick the width-best
+candidates in O(m log width) instead of O(m log m).
+"""
+
+import math, random, heapq
+from itertools import islice
+
+
+def _materialize(node):
+    """Walk an immutable path linked-list back to a plain Python list."""
+    out = []
+    while node is not None:
+        val, node = node
+        out.append(val)
+    out.reverse()
+    return out
+
+
+def equation_beam_search(
+    nums,
+    target,
+    r=0.5,
+    c=2,
+    max_beam_width=2000,
+):
+    """
+    Equation-driven subset-sum beam search with NO calibration/pilot search.
+
+    r is supplied directly by the caller and is never estimated from the
+    dataset.  This keeps the solver deterministic with respect to its
+    configured equation and avoids any calibration pass.
+
+    Beam width:
+        width(k) = min(max_beam_width, n^c, ceil(2^n * (1-r)^k))
+
+    The width calculation is performed in log-space to avoid overflow.
+    """
+    if not (0.0 < r < 1.0):
+        raise ValueError("r must be strictly between 0 and 1.")
+    if c <= 0:
+        raise ValueError("c must be positive.")
+    if max_beam_width < 1:
+        raise ValueError("max_beam_width must be >= 1.")
+
+    n = len(nums)
+    if n == 0:
+        return ([] if target == 0 else None), 0
+
+    theoretical_cap = n ** c
+    cap = min(theoretical_cap, max_beam_width)
+
+    # beam: list of (partial_sum, path_node)
+    # path_node is None or (value, parent)
+    beam = [(0, None)]
+
+    log_cap = math.log(cap)
+
+    for k in range(1, n + 1):
+        x = nums[k - 1]
+
+        # Deduplicate by partial sum.  Only one path is retained per sum.
+        seen = {}
+
+        for partial, node in beam:
+            # Exclude current item.
+            if partial not in seen:
+                seen[partial] = node
+
+            # Include current item.
+            new_partial = partial + x
+            if new_partial <= target and new_partial not in seen:
+                seen[new_partial] = (x, node)
+
+        if target in seen:
+            return _materialize(seen[target]), k
+
+        # Equation-driven pruning, with no calibration.
+        log_width = n * math.log(2.0) + k * math.log1p(-r)
+
+        if log_width >= log_cap:
+            width = int(cap)
+        else:
+            width = max(1, min(int(cap), math.ceil(math.exp(log_width))))
+
+        items = seen.items()
+
+        if len(items) <= width:
+            beam = list(items)
+        else:
+            beam = heapq.nsmallest(
+                width,
+                items,
+                key=lambda kv: abs(target - kv[0]),
+            )
+
+    return None, n
+
+
+# Hardware-independent top-level callbacks. Replace these with GPIO/motor code.
+DEMO_TOUCH_STATE = False
+
+
+def read_demo_touch_pin() -> bool:
+    return DEMO_TOUCH_STATE
+
+
+def demo_motor_move(limb: str, axis: str, move: int) -> None:
+    global DEMO_TOUCH_STATE
+    print(f"MOTOR: {limb} {axis}-axis move {move}")
+
+    # Demonstration only: create contact during one simulated move.
+    if limb == "right_arm" and axis == "x" and move == 230:
+        DEMO_TOUCH_STATE = True
+
+
+def demo_emergency_stop(limb: str, axis: str, reason: str) -> None:
+    print(f"!!! EMERGENCY STOP: {limb} {axis}-axis: {reason}")
+
+
+def normalize_angle(angle_deg: float) -> float:
+    return (angle_deg + 180.0) % 360.0 - 180.0
+
+
+@dataclass(frozen=True)
+class DeadAngle:
+    start_deg: float
+    end_deg: float
+    name: str = "dead-angle"
+
+    def contains(self, angle_deg: float) -> bool:
+        angle = normalize_angle(angle_deg)
+        start = normalize_angle(self.start_deg)
+        end = normalize_angle(self.end_deg)
+        if start <= end:
+            return start <= angle <= end
+        return angle >= start or angle <= end
+
+
+@dataclass
+class TouchSensor:
+    read_pressed: Callable[[], bool]
+    debounce_ms: int = 30
+    active_high: bool = True
+    _last_raw: bool = field(default=False, init=False)
+    _stable_state: bool = field(default=False, init=False)
+    _changed_at: float = field(default_factory=time.monotonic, init=False)
+
+    def pressed(self) -> bool:
+        raw = bool(self.read_pressed())
+        if not self.active_high:
+            raw = not raw
+
+        now = time.monotonic()
+        if raw != self._last_raw:
+            self._last_raw = raw
+            self._changed_at = now
+
+        if (now - self._changed_at) * 1000.0 >= self.debounce_ms:
+            self._stable_state = raw
+
+        return self._stable_state
+
+
+@dataclass
+class AxisJob:
+    limb: str
+    axis: str
+    moves: Sequence[int]
+    target: int
+    is_approach_axis: bool = False
+
+    # No calibration: r is a fixed solver parameter.
+    r: float = 0.5
+    c: float = 2.0
+    max_beam_width: int = 2000
+
+    dead_angles: Sequence[DeadAngle] = field(default_factory=tuple)
+    current_angle_deg: float = 0.0
+    degrees_per_move: float = 1.0
+
+
+@dataclass
+class AxisResult:
+    limb: str
+    axis: str
+    found: bool
+    moves_used: list[int] = field(default_factory=list)
+    steps_used: int = 0
+    r_used: Optional[float] = None
+    is_approach_axis: bool = False
+    single_stroke: Optional[bool] = None
+    safety_triggered: bool = False
+    safety_reason: Optional[str] = None
+    stopped_angle_deg: Optional[float] = None
+
+
+def angle_blocked(angle_deg: float, dead_angles: Sequence[DeadAngle]) -> bool:
+    return any(zone.contains(angle_deg) for zone in dead_angles)
+
+
+def angle_reason(angle_deg: float, dead_angles: Sequence[DeadAngle]) -> str:
+    names = [zone.name for zone in dead_angles if zone.contains(angle_deg)]
+    return ", ".join(names) if names else "clear"
+
+
+def path_enters_dead_angle(
+    current_angle_deg: float,
+    next_angle_deg: float,
+    dead_angles: Sequence[DeadAngle],
+    samples: int = 32,
+) -> bool:
+    count = max(2, samples)
+    for i in range(count + 1):
+        fraction = i / count
+        angle = current_angle_deg + (next_angle_deg - current_angle_deg) * fraction
+        if angle_blocked(angle, dead_angles):
+            return True
+    return False
+
+
+def plan_is_safe(job: AxisJob, moves: Sequence[int]) -> bool:
+    angle = job.current_angle_deg
+
+    if angle_blocked(angle, job.dead_angles):
+        return False
+
+    for move in moves:
+        next_angle = angle + move * job.degrees_per_move
+        if path_enters_dead_angle(angle, next_angle, job.dead_angles):
+            return False
+        angle = next_angle
+
+    return True
+
+
+
+def solve_candidate(
+    job: AxisJob,
+    candidate: Optional[Sequence[int]],
+    steps: int,
+) -> AxisResult:
+    if candidate is None:
+        return AxisResult(
+            limb=job.limb,
+            axis=job.axis,
+            found=False,
+            steps_used=steps,
+            r_used=job.r,
+            is_approach_axis=job.is_approach_axis,
+            single_stroke=True if job.is_approach_axis and job.target in job.moves else None,
+        )
+
+    candidate = list(candidate)
+
+    if not plan_is_safe(job, candidate):
+        return AxisResult(
+            limb=job.limb,
+            axis=job.axis,
+            found=False,
+            steps_used=steps,
+            r_used=job.r,
+            is_approach_axis=job.is_approach_axis,
+            single_stroke=False if job.is_approach_axis else None,
+            safety_triggered=True,
+            safety_reason="planned path enters dead angle",
+            stopped_angle_deg=job.current_angle_deg,
+        )
+
+    return AxisResult(
+        limb=job.limb,
+        axis=job.axis,
+        found=True,
+        moves_used=candidate,
+        steps_used=steps,
+        r_used=job.r,
+        is_approach_axis=job.is_approach_axis,
+        single_stroke=True if job.is_approach_axis and len(candidate) == 1 else (
+            False if job.is_approach_axis else None
+        ),
+    )
+
+
+def _solve_one_axis(job: AxisJob) -> AxisResult:
+    # A direct one-stroke approach is checked without running the subset-sum
+    # search, exactly as in the original approach-axis behavior.
+    if job.is_approach_axis and job.target in job.moves:
+        return solve_candidate(job, [job.target], 1)
+
+    result, steps = equation_beam_search(
+        job.moves,
+        job.target,
+        r=job.r,
+        c=job.c,
+        max_beam_width=job.max_beam_width,
+    )
+
+    return solve_candidate(job, result, steps)
+
+
+def solve_all_limbs(
+    jobs: Sequence[AxisJob],
+    max_workers: Optional[int] = None,
+) -> dict[tuple[str, str], AxisResult]:
+    results: dict[tuple[str, str], AxisResult] = {}
+
+    with ProcessPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(_solve_one_axis, job): (job.limb, job.axis)
+            for job in jobs
+        }
+
+        for future in as_completed(futures):
+            key = futures[future]
+            results[key] = future.result()
+
+    return results
+
+
+def _demo() -> None:
+    global DEMO_TOUCH_STATE
+    DEMO_TOUCH_STATE = False
+    random.seed(4)
+
+    touch_sensor = TouchSensor(
+        read_pressed=read_demo_touch_pin,
+        debounce_ms=0,
+        active_high=True,
+    )
+
+    limbs_config = {
+        "left_arm": {
+            "approach_axis": "z",
+            "dead_angles": (
+                DeadAngle(80.0, 100.0, "left receptacle wall"),
+                DeadAngle(-15.0, 15.0, "left mechanical dead angle"),
+            ),
+        },
+        "right_arm": {
+            "approach_axis": "x",
+            "dead_angles": (
+                DeadAngle(120.0, 145.0, "right receptacle wall"),
+            ),
+        },
+    }
+
+    def make_moves(n: int = 2000) -> list[int]:
+        return [random.randint(1, 500) for _ in range(n)]
+
+    jobs: list[AxisJob] = []
+    jobs_by_limb: dict[str, dict[str, AxisJob]] = {}
+
+    # Fixed r: no dataset calibration, pilot search, or automatic estimation.
+    SOLVER_R = 0.5
+
+    for limb, config in limbs_config.items():
+        approach_axis = config["approach_axis"]
+        jobs_by_limb[limb] = {}
+
+        for axis in ("x", "y", "z"):
+            moves = make_moves()
+            is_approach = axis == approach_axis
+
+            if is_approach and limb == "left_arm":
+                moves[0] = 187
+                target = 187
+            elif is_approach and limb == "right_arm":
+                target = sum(random.sample(moves, 4))
+                while target in moves:
+                    target += 1
+            else:
+                target = sum(random.sample(moves, 5))
+
+            job = AxisJob(
+                limb=limb,
+                axis=axis,
+                moves=moves,
+                target=target,
+                is_approach_axis=is_approach,
+                r=SOLVER_R,
+                max_beam_width=1500,
+                dead_angles=config["dead_angles"],
+                current_angle_deg=40.0,
+                degrees_per_move=0.01,
+            )
+
+            jobs.append(job)
+            jobs_by_limb[limb][axis] = job
+
+    print("NO CALIBRATION MODE")
+    print(f"Fixed solver r = {SOLVER_R}")
+    print(f"Solving {len(jobs)} (limb, axis) jobs concurrently...")
+
+    results = solve_all_limbs(jobs)
+
+    for limb, limb_jobs in jobs_by_limb.items():
+        axis_results = {
+            axis: results[(limb, axis)]
+            for axis in limb_jobs
+        }
+
+        print_grasp_plan(limb, axis_results)
+
+        execution = execute_grasp_plan(
+            limb=limb,
+            jobs_by_axis=limb_jobs,
+            results_by_axis=axis_results,
+            touch_sensor=touch_sensor,
+            move_callback=demo_motor_move,
+            stop_callback=demo_emergency_stop,
+        )
+
+        print(f"Execution result: {execution}")
+
+
+if __name__ == "__main__":
+    freeze_support()
+    _demo()

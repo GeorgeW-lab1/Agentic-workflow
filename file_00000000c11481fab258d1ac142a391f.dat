@@ -1,0 +1,923 @@
+Yes. The right approach is to **treat the old plotted pipeline as a mathematical specification**, measure its output distribution, and then derive a trainable SUM/DIAG network whose outputs are constrained to reproduce those same curves.
+
+I compared the actual source rather than the simplified ZIP I made earlier. The previous implementation was not equivalent.
+
+## 1. What the original plots are actually measuring
+
+The original system has several distinct transformations that must remain intact.
+
+### A. Token geometry
+
+For token (i), with frequency (f\_i) and vocabulary index (k\_i),
+
+[
+\hat f\_i=\frac{f\_i}{f\_{\max}},
+\qquad
+\hat k\_i=\frac{k\_i}{V-1}.
+]
+
+The source constructs
+
+[
+p\_i=
+\hat f\_i
+\begin{bmatrix}
+\cos(2\pi\hat k\_i)\\
+\sin(2\pi\hat k\_i)
+\end{bmatrix}
+]
+
+and
+
+[
+q\_i=
+\hat k\_i
+\begin{bmatrix}
+\cos(2\pi\hat f\_i)\\
+\sin(2\pi\hat f\_i)
+\end{bmatrix}.
+]
+
+This is explicitly how the original geometry is parameterized.
+
+For (p,q), the original geometric triple is
+
+[
+\rho =
+\left(
+1-\frac{||p|-|q||}{|p|+|q|}
+\right)
+(1-|\cos\phi|)
+]
+
+with
+
+[
+\cos\phi=\frac{p^\top q}{|p||q|},
+]
+
+while
+
+[
+\sigma=\frac14\sum\_{j=1}^{4}|T\_{j+1}-T\_j|
+]
+
+and
+
+[
+\theta=\operatorname{atan2}(\Delta y,\Delta x)\pmod{\pi}.
+]
+
+That is the actual source definition.
+
+**This geometry must be frozen identically in the new model.**
+
+---
+
+# 2. The original synaptic plot/operator
+
+The candidate-candidate kernel is
+
+# [ K\_{ij}
+
+e^{-\gamma(\sigma\_i-\sigma\_j)^2}
+\frac{1+\cos(\theta\_i-\theta\_j)}2
+e^{-\lambda(\rho\_i-\rho\_j)^2}.
+]
+
+The source then removes self-connections and normalizes each row:
+
+# [ W\_{ij}
+
+\frac{
+K\_{ij}\mathbf 1\_{i\ne j}
+}{
+\sum\_jK\_{ij}\mathbf 1\_{i\ne j}
+}.
+]
+
+This is explicitly a **SUM-normalized synaptic operator**.
+
+Then:
+
+[
+z\_{\rm syn}=Wz
+]
+
+and the source applies layer normalization:
+
+# [ \operatorname{LN}(z)
+
+\frac{z-\mu(z)}
+{\sigma(z)+\epsilon}.
+]
+
+
+
+So the new neural version should retain:
+
+# [ \boxed{ z\_{\rm syn}
+
+\operatorname{LN}(Wz)
+}
+]
+
+rather than replacing it with a generic linear layer.
+
+---
+
+# 3. The transitive SUM must remain
+
+The source doesn't simply use the candidate geometry.
+
+For context (w\_1,w\_2) and candidate (c):
+
+[
+p\_T=
+\frac14p\_1+
+\frac12p\_2+
+\frac14p\_c
+]
+
+and
+
+[
+q\_T=
+\frac14q\_1+
+\frac12q\_2+
+\frac14q\_c.
+]
+
+Then the same Thébault transformation produces
+
+[
+(\rho\_T,\theta\_T,\sigma\_T).
+]
+
+
+
+That is an important SUM structure:
+
+# [ \boxed{ T
+
+\frac14G(w\_1)
+\+
+\frac12G(w\_2)
+\+
+\frac14G(c)
+}
+]
+
+So the neural architecture should learn around this operation, **not replace it with an arbitrary context embedding**.
+
+---
+
+# 4. The actual original enrichment equation
+
+The source constructs a large raw logit sum. The relevant structural part is
+
+# [ z\_0
+
+b\_{\tau}
+\+
+b\_{\rm influence}
+\+
+b\_{\rm mandate}
+\+
+b\_{\rm CoT}
+\+
+b\_{\rm PDN}
+\+
+b\_{\rm chunk}
+\+
+b\_{\rm echo}
+\+
+b\_{\rm MRV}
+\+
+b\_{\rm orbit}
+\+
+b\_{\rm composition}
+\+
+b\_{\rm graph}
+\+
+b\_{\rm geometry}
+\+
+b\_{\rm punctuation}
+\+
+\log P\_{\rm LM}.
+]
+
+The ordering is reversed in the source, but the additions are commutative, so the scalar value is unchanged.
+
+The key point for the new model is:
+
+[
+\boxed{
+z\_0=\sum\_r b\_r
+}
+]
+
+not
+
+[
+z\_0=\operatorname{MLP}(x).
+]
+
+The MLP can learn the **coefficients of the terms**, but the structural SUM remains.
+
+---
+
+# 5. Influence-space term
+
+This was another thing my previous code omitted.
+
+The original candidate kernel is transformed by:
+
+[
+W\_0
+\overset{\operatorname{rank/log}}{\longrightarrow}
+W\_1
+\overset{\exp(\alpha W)}{\longrightarrow}
+Y.
+]
+
+The source defines
+
+# [ \ell\_{ij}
+
+-\log(1+\operatorname{rank}(W\_{ij}))
+]
+
+then shifts the result and applies
+
+[
+Y=e^{\alpha W\_1}.
+]
+
+The candidate influence is
+
+# [ I\_i
+
+\sum\_jY\_{ij}-Y\_{ii}.
+]
+
+
+
+That is a genuine **matrix SUM + matrix exponential** component.
+
+For the new network:
+
+## [ \boxed{ I=\left(e^{\alpha\mathcal R(W)}\right)\mathbf1
+
+\operatorname{diag}
+\left(e^{\alpha\mathcal R(W)}\right)
+}
+]
+
+where (\mathcal R) is the rank/log transform.
+
+---
+
+# 6. Then comes CSNS
+
+The source combines:
+
+# [ z\_{\rm enriched}
+
+z\_0
+\+
+\omega\_{\rm trans}b\_{\rm trans}
+\+
+\omega\_{\rm syn}z\_{\rm syn}.
+]
+
+
+
+Therefore the trainable version should have:
+
+# [ \boxed{ z\_e
+
+z\_0+
+\omega\_tT+
+\omega\_sWz\_0
+}
+]
+
+with
+
+[
+\omega\_s,\omega\_t>0
+]
+
+learned through softplus parameters.
+
+---
+
+# 7. The critical DNN pipeline
+
+This is where the previous code diverged.
+
+The actual source explicitly uses:
+
+[
+\boxed{
+\sigma
+\rightarrow
+\theta
+\rightarrow
+\operatorname{ReLU}\_{\theta}
+\rightarrow
+\rho
+\rightarrow
+T
+\rightarrow
+\operatorname{simplex}
+}
+]
+
+not a generic SUM/DIAG stack.
+
+### Sigma
+
+# [ s\_\sigma
+
+0.7+
+0.3
+\frac{\sigma}
+{\max\sigma+\epsilon}.
+]
+
+Then
+
+[
+z\_1=D\_\sigma z\_e.
+]
+
+where
+
+[
+D\_\sigma=\operatorname{diag}(s\_\sigma).
+]
+
+### Theta
+
+# [ s\_\theta
+
+\frac12(1+\cos\theta).
+]
+
+The next activation is
+
+# [ z\_2
+
+\operatorname{signedPower}
+\left(
+D\_\theta z\_1+0.3z\_e,
+1.5
+\right).
+]
+
+
+
+### Orientation ReLU
+
+Define
+
+[
+g\_i=
+\operatorname{ReLU}
+\left(
+s\_{\theta,i}
+-\overline{s\_\theta}
+\right)
+]
+
+and
+
+[
+\hat g\_i=
+\frac{g\_i}{\max\_jg\_j+\epsilon}.
+]
+
+Then:
+
+# [ z\_{2b}
+
+\hat g\odot z\_2
+\+
+(1-\hat g)\odot\operatorname{ReLU}(z\_2).
+]
+
+This is the actual plotted orientation gate.
+
+### Rho
+
+The source uses
+
+# [ r\_i
+
+1+
+0.5
+\operatorname{clip}
+\left(
+\frac{\rho\_i-\mu\_\rho}
+{\sigma\_\rho+\epsilon},
+-2.5,
+2.5
+\right).
+]
+
+Then:
+
+# [ z\_3
+
+\operatorname{signedPower}
+(
+D\_\rho z\_{2b},
+2
+).
+]
+
+
+
+---
+
+# 8. Temperature is geometric, not ordinary softmax temperature
+
+This is another major difference.
+
+The source does **not** simply calculate
+
+[
+z/T.
+]
+
+It calculates
+
+# [ w\_i(T)
+
+\exp
+\left[
+-\frac{\lambda\_T(\rho\_i-\bar\rho)^2}
+{\max(T,0.1)}
+\right]
+]
+
+and therefore
+
+# [ z\_i'
+
+z\_{3,i}w\_i(T).
+]
+
+
+
+So:
+
+[
+\boxed{
+T\text{ changes the geometry of the distribution}
+}
+]
+
+rather than merely flattening logits.
+
+---
+
+# 9. And the "probability" plot is not softmax
+
+This was the biggest mathematical mistake in the ZIP.
+
+The source does:
+
+[
+x'=x-\min\_i x\_i
+]
+
+then
+
+[
+x\_+ =
+\frac{x'^2}{|x'|+\epsilon}
+]
+
+with the source's smooth-power function, followed by
+
+[
+P\_i=
+\frac{\max(x\_{+,i},\epsilon)}
+{\sum\_j\max(x\_{+,j},\epsilon)}.
+]
+
+
+
+Therefore the actual plotted probability is:
+
+# [ \boxed{ P\_i
+
+\frac{
+\operatorname{SPR}(z\_i-\min z)
+}{
+\sum\_j\operatorname{SPR}(z\_j-\min z)
+}
+}
+]
+
+not
+
+[
+\operatorname{softmax}(z)\_i.
+]
+
+That means the new model must preserve this projection if the plots are supposed to match.
+
+---
+
+# 10. The exact new mathematical model
+
+So I would define the trainable network as:
+
+# [ \boxed{ P\_\theta(c|w\_1,w\_2)
+
+\Pi\_1
+\left[
+G\_T
+\left(
+D\_\rho
+\left|
+R\_\theta
+\left|
+D\_\theta
+D\_\sigma
+z\_e
+\+
+0.3z\_e
+\right|^{1.5}
+\right|^{2}
+\right)
+\right]
+}
+]
+
+where:
+
+# [ z\_e
+
+z\_0
+\+
+\omega\_tT\_c
+\+
+\omega\_sWz\_0
+]
+
+and
+
+# [ z\_0
+
+\sum\_r
+\alpha\_r
+\phi\_r(w\_1,w\_2,c).
+]
+
+The (\phi\_r)'s are the **same features the old algorithm plotted**.
+
+That gives us the new neural parameterization:
+
+[
+\boxed{
+\theta=
+{
+\alpha\_r,\omega\_s,\omega\_t,
+\lambda\_T,
+\text{diagonal gate parameters},
+\text{context parameters}
+}
+}
+]
+
+while keeping the geometric structure fixed.
+
+---
+
+# 11. What the plots should now compare
+
+There should be **two forward passes over exactly the same contexts and candidates**.
+
+### Reference specification
+
+# [ P\_{\rm ref}
+
+F\_{\rm old}(x).
+]
+
+### Neural realization
+
+# [ P\_\theta
+
+F\_{\rm neural}(x;\theta).
+]
+
+Then every plot uses:
+
+[
+\boxed{
+(P\_{\rm ref},P\_\theta)
+}
+]
+
+not two independently constructed statistics.
+
+### Plot 1 — probability spectrum
+
+Sort both:
+
+[
+P\_{\rm ref}^{\downarrow},
+\qquad
+P\_\theta^{\downarrow}.
+]
+
+Plot:
+
+[
+P\_{\rm ref}^{\downarrow}(r)
+\quad\text{vs}\quad
+P\_\theta^{\downarrow}(r).
+]
+
+Loss:
+
+# [ L\_{\rm spectrum}
+
+## \frac1K \sum\_r \left( P\_{\rm ref}^{\downarrow}(r)
+
+P\_\theta^{\downarrow}(r)
+\right)^2.
+]
+
+---
+
+### Plot 2 — entropy
+
+Use the actual plotted probabilities:
+
+# [ H(P)
+
+-\sum\_iP\_i\log(P\_i+\epsilon).
+]
+
+Then:
+
+[
+L\_H=
+(H\_{\rm ref}-H\_\theta)^2.
+]
+
+---
+
+### Plot 3 — combinatorial footprint
+
+This one should **not** use (e^H).
+
+For the actual trigram counts:
+
+# [ \boxed{ F\_{\rm data}
+
+\sum\_c {n\_c\choose2}
+}
+]
+
+which is exactly
+
+# [ F\_{\rm data}
+
+\frac12
+\sum\_c n\_c(n\_c-1).
+]
+
+For a neural probability distribution, let
+
+[
+N=\sum\_cn\_c.
+]
+
+The expected number of equal-candidate pairs is:
+
+# [ E[F\_\theta]
+
+{N\choose2}
+\sum\_cp\_\theta(c)^2.
+]
+
+Therefore:
+
+# [ \boxed{ F\_\theta
+
+\frac{N(N-1)}2
+|P\_\theta|\_2^2
+}
+]
+
+and, importantly, for the empirical distribution
+
+[
+p\_c=\frac{n\_c}{N},
+]
+
+we recover:
+
+# [ {N\choose2} \sum\_c \left(\frac{n\_c}{N}\right)^2
+
+\frac{N-1}{2N}
+\sum\_cn\_c^2.
+]
+
+This is **related to**, but not identical to, (\sum\_c{n\_c\choose2}).
+
+So if the original plot is explicitly showing:
+
+[
+\sum\_c{n\_c\choose2},
+]
+
+the new plot should display that exact quantity as the target and separately display the neural expected pair count.
+
+The footprint loss is:
+
+## [ \boxed{ L\_F= \left[ \log(1+F\_{\rm data})
+
+\log(1+F\_\theta)
+\right]^2
+}
+]
+
+to prevent high-count contexts from completely dominating.
+
+---
+
+# 12. The actual backpropagation objective
+
+The new loss should therefore be:
+
+[
+\boxed{
+L=
+\lambda\_{\rm prob}L\_{\rm prob}
+\+
+\lambda\_{\rm spec}L\_{\rm spectrum}
+\+
+\lambda\_HL\_H
+\+
+\lambda\_FL\_F
+\+
+\lambda\_{\rm cdf}L\_{\rm cdf}
+\+
+\lambda\_{\rm geom}L\_{\rm geom}
+}
+]
+
+with:
+
+# [ L\_{\rm prob}
+
+-\sum\_iP\_{\rm ref,i}
+\log(P\_{\theta,i}+\epsilon)
+]
+
+and
+
+# [ L\_{\rm cdf}
+
+## \frac1K \sum\_i \left[ \operatorname{CDF}(P\_{\rm ref})\_i
+
+\operatorname{CDF}(P\_\theta)\_i
+\right]^2.
+]
+
+The crucial point is:
+
+[
+\boxed{
+\text{the plot metric itself is differentiated}
+}
+]
+
+rather than calculating a plot after training.
+
+---
+
+# 13. One additional thing I would change
+
+There is a subtle problem with directly backpropagating through the exact old operations:
+
+- `topk`
+- rank sorting
+- hard candidate selection
+- `argmax`
+- the `max()` normalizations
+- Python-side geometry construction
+
+These are either nondifferentiable or have undesirable zero-gradient regions.
+
+So the rigorous architecture should have **two representations**:
+
+```
+                 DATA
+                  │
+                  ▼
+        ┌───────────────────┐
+        │ exact specification│
+        │      F_ref         │
+        └─────────┬─────────┘
+                  │
+              P_ref
+                  │
+                  │
+                  ▼
+       ┌─────────────────────┐
+       │ differentiable      │
+       │ SUM + DIAG network  │
+       │       F_theta       │
+       └──────────┬──────────┘
+                  │
+              P_theta
+                  │
+        ┌─────────┴──────────┐
+        │                    │
+   same plots          differentiable
+        │                    │
+        └─────────┬──────────┘
+                  ▼
+                LOSS
+                  │
+                  ▼
+              BACKPROP
+
+```
+
+The first branch is **not a legacy model used for generation**. It is the mathematical reference implementation used to establish what the new network must reproduce.
+
+At inference time:
+
+[
+\boxed{
+\text{only }F\_\theta\text{ runs}
+}
+]
+
+---
+
+## The resulting code architecture
+
+The new file should consequently have these exact modules:
+
+```
+Geometry
+    └── ThebaultGeometry
+
+ReferenceSpecification
+    ├── exact_trigram_distribution
+    ├── exact_synaptic_kernel
+    ├── exact_transitive_sum
+    ├── exact_influence_space
+    ├── exact_dnn_pipeline
+    └── exact_probability_projection
+
+SumDiagNeuralNetwork
+    ├── ContextSUM
+    ├── CandidateSUM
+    ├── SynapticSUM
+    ├── TransitiveSUM
+    ├── InfluenceSUM
+    ├── DIAG_sigma
+    ├── DIAG_theta
+    ├── ReLU_theta
+    ├── DIAG_rho
+    ├── geometric_temperature
+    └── exact-style probability projection
+
+PlotMetrics
+    ├── probability spectrum
+    ├── entropy
+    ├── combinatorial footprint
+    ├── CDF
+    ├── temperature curve
+    └── geometry distributions
+
+BackpropObjective
+    ├── probability loss
+    ├── spectrum loss
+    ├── entropy loss
+    ├── footprint loss
+    └── CDF loss
+
+Generator
+    └── neural network only
+
+```
+
+That is the version I'd build next.
+
+The important correction is that **the old plot equations become the specification of the new network**, rather than inventing new probability measures that happen to resemble the old plots. The source explicitly gives us enough structure to do that: Thébault geometry, SUM-normalized synaptic kernel, transitive SUM, influence-space matrix exponential, σ→θ→ReLU→ρ→temperature ordering, and the custom simplex projection.
+
+If we implement it this way, **matching the old plots becomes an explicit mathematical constraint on backpropagation**, rather than something we check only after the model has trained.

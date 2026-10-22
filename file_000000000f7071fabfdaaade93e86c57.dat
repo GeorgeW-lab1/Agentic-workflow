@@ -1,0 +1,769 @@
+import numpy as np
+import re
+
+
+class InfluenceSpaceMarkov:
+
+    def __init__(
+        self,
+        beta=2.0,
+        alpha=3.0,
+        rank=64          # NEW: k, the low-rank dimension
+    ):
+        self.beta = beta
+        self.alpha = alpha
+        self.rank = rank
+
+
+    def fit(self, text):
+
+        # ---------------------
+        # SENTENCE SPLIT
+        # ---------------------
+
+        sentences = re.split(
+            r'(?<=[.!?])\s+',
+            text.strip()
+        )
+
+        sentence_words = [
+            s.lower().split()
+            for s in sentences
+            if s.strip()
+        ]
+
+        self.sentences = sentence_words
+
+
+        words = [
+            w
+            for s in sentence_words
+            for w in s
+        ]
+
+
+        self.vocab = sorted(
+            set(words)
+        )
+
+
+        self.word_to_idx = {
+            w:i
+            for i,w in enumerate(self.vocab)
+        }
+
+
+        n=len(self.vocab)
+
+
+
+        # ---------------------
+        # MARKOV MATRIX
+        # ---------------------
+
+        counts=np.zeros(
+            (n,n)
+        )
+
+
+        for sent in sentence_words:
+
+            for a,b in zip(
+                sent[:-1],
+                sent[1:]
+            ):
+
+                i=self.word_to_idx[a]
+                j=self.word_to_idx[b]
+
+                counts[i,j]+=1
+
+
+        self.counts=counts
+
+
+
+        # ---------------------
+        # INFLUENCE FIELD
+        # (Z is built transiently just to factorize it —
+        #  it is NOT kept around afterward)
+        # ---------------------
+
+        Y=np.exp(
+            self.beta *
+            np.log1p(counts)
+        )
+
+
+        Y[counts==0]=0
+
+        self.Y=Y
+
+
+
+        ymax=max(
+            Y.max(),
+            1
+        )
+
+
+        Z=np.exp(
+            self.alpha *
+            (Y/ymax)
+        )
+
+
+        Z[Y==0]=0
+
+
+
+        # ---------------------
+        # LOW-RANK FACTORIZATION + RIGHT INVERSE
+        #
+        # Z (n x n) is approximated as F @ Gt, where:
+        #   F  is (n x k)  -- per-word "loadings"
+        #   Gt is (k x n)  -- k orthonormal basis rows
+        #
+        # Because Gt has orthonormal rows (Gt @ Gt.T = I_k),
+        # its Moore-Penrose RIGHT INVERSE is just Gt.T itself:
+        #     Gt @ (Gt.T) = I_k
+        # so no explicit inversion is ever computed, and the
+        # full n x n Z / P matrices are never stored.
+        # ---------------------
+
+        k=min(
+            self.rank,
+            n-1 if n>1 else 1
+        )
+
+
+        U,S,Vt=np.linalg.svd(
+            Z,
+            full_matrices=False
+        )
+
+
+        U_k=U[:,:k]
+        S_k=S[:k]
+        Vt_k=Vt[:k,:]        # orthonormal rows: Vt_k @ Vt_k.T = I_k
+
+
+        self.F=U_k*S_k        # (n, k) loadings
+        self.Gt=Vt_k          # (k, n) right-inverse-of-itself basis
+
+        # sanity note: right_inverse = self.Gt.T, and
+        # self.Gt @ right_inverse ≈ I_k (identity of size k)
+
+
+        del Z  # never retained; only the (n,k) and (k,n) factors are
+
+
+
+        # ---------------------
+        # CLASSICAL CO-OCCURRENCE
+        # ---------------------
+
+        window=4
+
+        cooc=np.zeros(
+            (n,n)
+        )
+
+
+        for sent in sentence_words:
+
+            for i,w in enumerate(sent):
+
+                wi=self.word_to_idx[w]
+
+                left=max(
+                    0,
+                    i-window
+                )
+
+                right=min(
+                    len(sent),
+                    i+window+1
+                )
+
+
+                for j in range(left,right):
+
+                    if i==j:
+                        continue
+
+                    wj=self.word_to_idx[
+                        sent[j]
+                    ]
+
+                    cooc[wi,wj]+=1
+
+
+
+        self.cooc=cooc
+
+
+
+        # ---------------------
+        # COSINE SPACE
+        # ---------------------
+
+        norms=np.linalg.norm(
+            cooc,
+            axis=1,
+            keepdims=True
+        )
+
+
+        norms[norms==0]=1
+
+
+        E=cooc/norms
+
+
+        self.embedding=E
+
+
+        self.cosine=(
+            E @ E.T
+        )
+
+
+        return self
+
+
+
+    # =================================================
+    # Reconstruct a single row of Z/P on demand from the
+    # low-rank factors, using the right inverse relation.
+    # Cost: O(n*k) instead of storing an O(n^2) matrix.
+    # =================================================
+
+    def _transition_row(
+        self,
+        i
+    ):
+
+        row=self.F[i,:] @ self.Gt   # (k,) @ (k,n) -> (n,)
+
+        row=np.maximum(
+            row,
+            0
+        )
+
+        s=row.sum()
+
+        if s==0:
+            return row
+
+        return row/s
+
+
+
+    # =================================================
+    # SPACE A
+    # INFLUENCE GENERATOR
+    # =================================================
+
+    def influence_generate(
+        self,
+        start,
+        length=50
+    ):
+
+        start=start.lower()
+
+
+        if start not in self.word_to_idx:
+
+            start=np.random.choice(
+                self.vocab
+            )
+
+
+        current=start
+
+        result=[
+            current
+        ]
+
+
+        for _ in range(length):
+
+            i=self.word_to_idx[current]
+
+            p=self._transition_row(i)
+
+
+            if p.sum()==0:
+                break
+
+
+            current=np.random.choice(
+                self.vocab,
+                p=p
+            )
+
+
+            result.append(
+                current
+            )
+
+
+        return result
+
+
+
+    # =================================================
+    # SPACE B
+    # COSINE WALK
+    # =================================================
+
+    def semantic_generate(
+        self,
+        start,
+        length=50
+    ):
+
+        start=start.lower()
+
+
+        if start not in self.word_to_idx:
+
+            start=np.random.choice(
+                self.vocab
+            )
+
+
+        current=start
+
+        result=[
+            current
+        ]
+
+
+        for _ in range(length):
+
+            i=self.word_to_idx[current]
+
+
+            sim=self.cosine[i].copy()
+
+
+            sim[i]=0
+
+
+            sim=np.maximum(
+                sim,
+                0
+            )
+
+
+            if sim.sum()==0:
+                break
+
+
+            sim/=sim.sum()
+
+
+            current=np.random.choice(
+                self.vocab,
+                p=sim
+            )
+
+
+            result.append(
+                current
+            )
+
+
+        return result
+
+
+
+    # =================================================
+    # VECTOR REPRESENTATION
+    # =================================================
+
+    def sentence_vector(
+        self,
+        words
+    ):
+
+        vectors=[]
+
+
+        for w in words:
+
+            if w in self.word_to_idx:
+
+                i=self.word_to_idx[w]
+
+                vectors.append(
+                    self.embedding[i]
+                )
+
+
+        if not vectors:
+
+            return np.zeros(
+                len(self.vocab)
+            )
+
+
+        return np.mean(
+            vectors,
+            axis=0
+        )
+
+
+
+    def cosine_similarity(
+        self,
+        a,
+        b
+    ):
+
+        denom=(
+            np.linalg.norm(a)
+            *
+            np.linalg.norm(b)
+        )
+
+
+        if denom==0:
+            return 0
+
+
+        return np.dot(a,b)/denom
+
+
+
+    # =================================================
+    # POLYGON CHORD DIAGRAM
+    #
+    # Places n words as vertices of a regular n-gon and
+    # draws curved (quadratic-bezier) edges between the
+    # strongest related pairs. "transition" mode reuses
+    # the low-rank F/Gt factors on-demand, so it never
+    # touches an n x n matrix even for this plot.
+    # =================================================
+
+    def plot_chord_diagram(
+        self,
+        metric="cosine",
+        top_k=3,
+        max_words=60,
+        figsize=(9,9),
+        curvature=0.75,
+        save_path=None
+    ):
+
+        import matplotlib.pyplot as plt
+
+
+        n_total=len(self.vocab)
+
+
+        if max_words is not None and n_total>max_words:
+
+            freq=self.cooc.sum(axis=1)
+
+            idx=np.argsort(-freq)[:max_words]
+
+            idx=np.sort(idx)
+
+        else:
+
+            idx=np.arange(n_total)
+
+
+        n=len(idx)
+
+        words=[
+            self.vocab[i]
+            for i in idx
+        ]
+
+
+        # regular n-gon vertex positions
+        angles=np.linspace(
+            0,
+            2*np.pi,
+            n,
+            endpoint=False
+        )
+
+        xs=np.cos(angles)
+        ys=np.sin(angles)
+
+
+        if metric=="cosine":
+
+            M=self.cosine[
+                np.ix_(idx,idx)
+            ]
+
+        elif metric=="transition":
+
+            M=np.zeros((n,n))
+
+            for a_i,orig_i in enumerate(idx):
+
+                row=self._transition_row(orig_i)
+
+                M[a_i]=row[idx]
+
+        else:
+
+            raise ValueError(
+                "metric must be 'cosine' or 'transition'"
+            )
+
+
+        np.fill_diagonal(M,0)
+
+
+        fig,ax=plt.subplots(figsize=figsize)
+
+        ax.set_aspect("equal")
+        ax.axis("off")
+
+
+        max_strength=M.max() if M.max()>0 else 1
+
+
+        for i in range(n):
+
+            row=M[i]
+
+            if row.sum()==0:
+                continue
+
+            top_idx=np.argsort(-row)[:top_k]
+
+
+            for j in top_idx:
+
+                w=row[j]
+
+                if w<=0:
+                    continue
+
+                p0=np.array([xs[i],ys[i]])
+                p1=np.array([xs[j],ys[j]])
+
+                mid=(p0+p1)/2
+
+                control=mid*(1-curvature)   # pulled toward center -> arc
+
+                t=np.linspace(0,1,40)
+
+                bez=(
+                    ((1-t)[:,None]**2)*p0
+                    +(2*(1-t)*t)[:,None]*control
+                    +(t**2)[:,None]*p1
+                )
+
+                alpha=0.15+0.65*(w/max_strength)
+                lw=0.5+2.5*(w/max_strength)
+
+                ax.plot(
+                    bez[:,0],
+                    bez[:,1],
+                    color="steelblue",
+                    alpha=alpha,
+                    linewidth=lw
+                )
+
+
+        ax.scatter(
+            xs,
+            ys,
+            s=30,
+            color="darkorange",
+            zorder=5
+        )
+
+
+        for i,word in enumerate(words):
+
+            angle=angles[i]
+
+            lx,ly=1.12*np.cos(angle),1.12*np.sin(angle)
+
+            rotation=np.degrees(angle)
+
+
+            if 90<rotation<270:
+
+                rotation+=180
+                ha="right"
+
+            else:
+
+                ha="left"
+
+
+            ax.text(
+                lx,ly,word,
+                fontsize=8,
+                ha=ha,
+                va="center",
+                rotation=rotation,
+                rotation_mode="anchor"
+            )
+
+
+        ax.set_xlim(-1.4,1.4)
+        ax.set_ylim(-1.4,1.4)
+
+
+        title_metric=(
+            "Cosine Similarity"
+            if metric=="cosine"
+            else "Low-Rank Transition Strength"
+        )
+
+        ax.set_title(
+            f"Word Relationship Chord Diagram ({title_metric})",
+            fontsize=12
+        )
+
+
+        if save_path:
+
+            fig.savefig(
+                save_path,
+                dpi=150,
+                bbox_inches="tight"
+            )
+
+
+        return fig
+
+
+
+    # =================================================
+    # INTERSECTION SELECTOR
+    # =================================================
+
+    def intersection_generate(
+        self,
+        start,
+        candidates=50,
+        length=50
+    ):
+
+
+        # semantic target
+
+        semantic_path=self.semantic_generate(
+            start,
+            length
+        )
+
+
+        semantic_vector=self.sentence_vector(
+            semantic_path
+        )
+
+
+        best=None
+
+
+        for _ in range(candidates):
+
+
+            candidate=self.influence_generate(
+                start,
+                length
+            )
+
+
+            candidate_vector=self.sentence_vector(
+                candidate
+            )
+
+
+            score=self.cosine_similarity(
+                candidate_vector,
+                semantic_vector
+            )
+
+
+            if best is None or score>best[0]:
+
+                best=(
+                    score,
+                    candidate
+                )
+
+
+        return best
+
+
+
+# =====================================================
+# LOAD CORPUS
+# =====================================================
+
+
+with open(
+    "singlekb.txt",
+    "r",
+    encoding="utf8"
+) as f:
+
+    corpus=f.read()
+
+
+
+model=InfluenceSpaceMarkov(
+    beta=2.0,
+    alpha=3.0,
+    rank=64
+)
+
+
+model.fit(
+    corpus
+)
+
+
+
+# =====================================================
+# CHAT
+# =====================================================
+
+
+while True:
+
+    prompt=input(
+        "USER: "
+    ).strip()
+
+
+    if not prompt:
+        continue
+
+
+    seed=prompt.split()[-1]
+
+
+    score,result=model.intersection_generate(
+        seed,
+        candidates=30,
+        length=60
+    )
+
+
+    print()
+
+    print(
+        " ".join(result)
+    )
+
+    print(
+        "-"*80
+    )

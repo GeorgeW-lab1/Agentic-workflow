@@ -1,0 +1,1125 @@
+"""CUDA-first stochastic polymorphic number generator and bijective automorphism filter.
+
+This version is CUDA-only for numerical computation. Host-side Python is used
+only for text/file/UI orchestration; all tensors, matrix operations, sampling,
+automorphism, routing, connectome, and correlation arithmetic execute on CUDA.
+
+Run:
+    pip install torch gradio plotly ultralytics
+    python app_cuda_automorphism.py
+    python app_cuda_automorphism.py --share
+
+Requires an NVIDIA CUDA-capable PyTorch installation.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import torch
+import plotly.graph_objects as go
+
+if not torch.cuda.is_available():
+    raise RuntimeError(
+        "CUDA is required by this GPU-only build. "
+        "Install a CUDA-enabled PyTorch build and run with an NVIDIA GPU."
+    )
+
+DEVICE = torch.device("cuda")
+CUDA_INDEX = torch.cuda.current_device()
+torch.set_default_device(DEVICE)
+
+def gpu_tensor(data, dtype=torch.float32):
+    """Create tensors directly on CUDA; never create an intermediate CPU tensor."""
+    return torch.as_tensor(data, dtype=dtype, device=DEVICE)
+
+def gpu_long(data):
+    return torch.as_tensor(data, dtype=torch.long, device=DEVICE)
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+BOS, EOS = "<bos>", "<eos>"
+SPECIAL = {BOS, EOS}
+
+MODEL_PATH = "model_auto.json"
+BINDINGS_PATH = "bindings_auto.json"
+DEFAULT_CORPUS = "corpus_auto.txt"
+
+ALPHA = 0.05
+TEMP = 0.8
+TOP_K = 20
+MAX_NEW = 800
+MAX_SUBSET = 5
+XCORR_WEIGHT = 1.5
+
+
+def tokenize(text: str) -> List[str]:
+    return text.lower().split()
+
+
+def sentences(text: str) -> List[str]:
+    out = []
+    for x in text.split("."):
+        x = x.strip()
+        if x:
+            out.append(x + ".")
+    return out
+
+
+def bow(tokens: List[str]) -> Counter:
+    return Counter(x for x in tokens if x not in SPECIAL)
+
+
+def matrix(vectors: List[Dict[str, float]], keys: List[str]) -> torch.Tensor:
+    # One CPU-side comprehension creates Python scalars only; tensor allocation
+    # and all subsequent numerical work are CUDA-resident.
+    return gpu_tensor([[v.get(k, 0.0) for k in keys] for v in vectors])
+
+
+def gpu_cosine(query: Dict[str, float], vectors: List[Dict[str, float]]) -> torch.Tensor:
+    keys = sorted(set(query).union(*(v.keys() for v in vectors))) if vectors else []
+    if not keys:
+        return torch.zeros(len(vectors), device=DEVICE)
+    q = gpu_tensor([query.get(k, 0.0) for k in keys])
+    x = matrix(vectors, keys)
+    return (x @ q) / (
+        torch.linalg.vector_norm(x, dim=1)
+        * torch.linalg.vector_norm(q)
+    ).clamp_min(1e-12)
+
+
+def gpu_gain(target: Dict[str, float], vectors: List[Dict[str, float]]) -> torch.Tensor:
+    keys = sorted(target)
+    if not keys:
+        return torch.zeros(len(vectors), device=DEVICE)
+    t = torch.tensor(
+        [target[k] for k in keys],
+        dtype=torch.float32,
+        device=DEVICE,
+    )
+    return torch.minimum(matrix(vectors, keys), t).sum(dim=1)
+
+
+def gpu_automorphism_matrix(
+    vectors: List[Dict[str, float]], theta: float = 0.5
+) -> torch.Tensor:
+    if not vectors:
+        return torch.empty((0, 0), device=DEVICE)
+
+    keys = sorted(set().union(*(v.keys() for v in vectors)))
+    x = matrix(vectors, keys)
+    _, num_keys = x.shape
+
+    if num_keys > 1:
+        # Generator is deterministic and generated directly on CUDA.
+        gen = torch.Generator(device=DEVICE)
+        gen.manual_seed(42)
+        A = torch.randn(
+            (num_keys, num_keys),
+            generator=gen,
+            device=DEVICE,
+            dtype=torch.float32,
+        )
+        A = A - A.T
+        Q = torch.linalg.matrix_exp(theta * A)
+        x_transformed = x @ Q
+    else:
+        x_transformed = x
+
+    n = torch.linalg.vector_norm(
+        x_transformed, dim=1, keepdim=True
+    ).clamp_min(1e-12)
+    return (x_transformed @ x_transformed.T) / (n @ n.T)
+
+
+class Bindings:
+    def __init__(self, threshold: float = 0.35, momentum: float = 0.85):
+        self.threshold = threshold
+        self.momentum = momentum
+        self.contexts = {}
+        self.links = {}
+
+    def update(self, text: str, incremental: bool = False):
+        incoming = defaultdict(Counter)
+        for s in sentences(text):
+            t = tokenize(s)
+            for i, w in enumerate(t):
+                incoming[w].update(t[max(0, i - 4):min(len(t), i + 5)])
+
+        if incremental and self.contexts:
+            merged = defaultdict(Counter)
+            for w, v in self.contexts.items():
+                merged[w].update(v)
+            for w, v in incoming.items():
+                for k, x in v.items():
+                    merged[w][k] = (
+                        self.momentum * merged[w][k]
+                        + (1.0 - self.momentum) * x
+                    )
+            self.contexts = dict(merged)
+        else:
+            self.contexts = dict(incoming)
+
+        self.rebuild()
+
+    def rebuild(self):
+        words = list(self.contexts)
+        vectors = [
+            {k: float(x) for k, x in self.contexts[w].items()}
+            for w in words
+        ]
+        if not words:
+            self.links = {}
+            return
+
+        scores = gpu_automorphism_matrix(vectors)
+        links = {}
+
+        if len(words) == 1:
+            self.links = {words[0]: {}}
+            return
+
+        k = min(8, len(words) - 1)
+        values, idx = torch.topk(scores, k=k, dim=1)
+
+        for i, w in enumerate(words):
+            row_values = values[i]
+            row_idx = idx[i]
+            links[w] = {
+                words[int(j.item())]: float(v.item())
+                for v, j in zip(row_values, row_idx)
+                if float(v.item()) >= self.threshold
+                and int(j.item()) != i
+            }
+
+        self.links = links
+
+    def expand(self, v: Dict[str, float]) -> Dict[str, float]:
+        out = defaultdict(float)
+        for w, x in v.items():
+            out[w] += x
+            for z, s in self.links.get(w, {}).items():
+                out[z] += x * s
+        return dict(out)
+
+    def save(self):
+        Path(BINDINGS_PATH).write_text(
+            json.dumps(
+                {
+                    "threshold": self.threshold,
+                    "momentum": self.momentum,
+                    "links": self.links,
+                    "contexts": {
+                        w: dict(v) for w, v in self.contexts.items()
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf8",
+        )
+
+    @classmethod
+    def load(cls):
+        x = cls()
+        if not Path(BINDINGS_PATH).exists():
+            return x
+        d = json.loads(Path(BINDINGS_PATH).read_text(encoding="utf8"))
+        x.threshold = d.get("threshold", 0.35)
+        x.momentum = d.get("momentum", 0.85)
+        x.links = d.get("links", {})
+        x.contexts = {
+            w: Counter(v) for w, v in d.get("contexts", {}).items()
+        }
+        return x
+
+    def summary(self):
+        return (
+            f"Device: {DEVICE}\n"
+            f"CUDA available: {torch.cuda.is_available()}\n"
+            f"Bijective Automorphism Nodes: {len(self.links)}\n"
+            f"Active Tensor Links: {sum(len(x) for x in self.links.values())}"
+        )
+
+
+class Ref:
+    def __init__(self, i, s, t, freq, features):
+        self.i = i
+        self.s = s
+        self.t = t
+        self.freq = freq
+        self.f = features
+
+
+class Match:
+    def __init__(self, rank, ref, score, vector, selected, endpoint):
+        self.rank = rank
+        self.ref = ref
+        self.score = score
+        self.vector = vector
+        self.selected = selected
+        self.endpoint = endpoint
+
+
+class Corpus:
+    def __init__(self, text="", bindings=None):
+        self.bindings = bindings or Bindings()
+        if text:
+            self.bindings.update(text)
+
+        ss = sentences(text)
+        freq = Counter(s.lower() for s in ss)
+        self.refs = []
+
+        for i, s in enumerate(ss):
+            t = tokenize(s)
+            f = self.bindings.expand(
+                {k: float(v) for k, v in bow(t).items()}
+            )
+            self.refs.append(Ref(i, s, t, freq[s.lower()], f))
+
+    def search(self, prompt, limit=5):
+        target = self.bindings.expand(
+            {k: float(v) for k, v in bow(tokenize(prompt)).items()}
+        )
+        vectors = [r.f for r in self.refs]
+
+        if not vectors:
+            return []
+
+        scores = gpu_cosine(target, vectors)
+        gains = gpu_gain(target, vectors)
+
+        chosen = []
+        covered = defaultdict(float)
+
+        for _ in range(min(MAX_SUBSET, len(self.refs))):
+            residual = {
+                k: max(0.0, v - covered[k])
+                for k, v in target.items()
+            }
+            rg = gpu_gain(residual, vectors)
+
+            if chosen:
+                mask = torch.zeros(len(self.refs), dtype=torch.bool, device=DEVICE)
+                mask[gpu_long(chosen)] = True
+                rg = rg.masked_fill(mask, -float("inf"))
+
+            j = int(torch.argmax(rg).item())
+            if float(rg[j].item()) <= 0:
+                break
+
+            chosen.append(j)
+            for k, v in self.refs[j].f.items():
+                covered[k] += v
+
+        rows = []
+        prompt_set = set(tokenize(prompt))
+
+        for i, r in enumerate(self.refs):
+            if i in chosen or float(gains[i].item()) > 0:
+                rset = set(r.t)
+                overlap = len(prompt_set & rset) / max(
+                    1, len(prompt_set | rset)
+                )
+                score = (
+                    0.7 * float(scores[i].item())
+                    + 0.2 * overlap
+                    + 0.1 * math.log1p(r.freq)
+                )
+                rows.append(
+                    Match(
+                        0,
+                        r,
+                        score,
+                        float(scores[i].item()),
+                        i in chosen,
+                        i not in chosen,
+                    )
+                )
+
+        rows.sort(key=lambda x: x.score, reverse=True)
+        for i, x in enumerate(rows[:limit], 1):
+            x.rank = i
+        return rows[:limit]
+
+
+class NGram:
+    def __init__(self):
+        self.vocab = {}
+        self.inv = []
+        self.uni = Counter()
+        self.bi = defaultdict(Counter)
+        self.tri = defaultdict(Counter)
+
+    def ingest(self, text):
+        for s in sentences(text):
+            q = [BOS, BOS, *tokenize(s), EOS]
+            self.uni.update(q)
+            for a, b in zip(q, q[1:]):
+                self.bi[a][b] += 1
+            for a, b, c in zip(q, q[1:], q[2:]):
+                self.tri[(a, b)][c] += 1
+
+        self.inv = sorted(self.uni)
+        self.vocab = {w: i for i, w in enumerate(self.inv)}
+        return self
+
+    def gpu_logits(self, history):
+        a, b = history[-2:]
+        counts = self.tri.get((a, b)) or self.bi.get(b) or self.uni
+
+        v = torch.full(
+            (len(self.inv),),
+            -float("inf"),
+            device=DEVICE,
+            dtype=torch.float32,
+        )
+
+        if not counts:
+            return v
+
+        words = list(counts.keys())
+        counts_gpu = gpu_tensor([float(counts[w]) for w in words])
+        denom = counts_gpu.sum() + ALPHA * len(words)
+        probs = (counts_gpu + ALPHA) / denom
+
+        ids = gpu_long([self.vocab[w] for w in words])
+        v.scatter_(0, ids, torch.log(probs))
+        return v
+
+    def bias_from(self, seeds):
+        out = {}
+        for w in seeds:
+            c = self.bi.get(w)
+            total = sum(c.values()) if c else 0
+            if total:
+                for z, n in c.items():
+                    out[z] = out.get(z, 0.0) + n / total
+        return out
+
+    def sample(self, history, bias=None):
+        logits = self.gpu_logits(history)
+
+        if bias:
+            words = [w for w in bias if w in self.vocab]
+            if words:
+                ids = gpu_long([self.vocab[w] for w in words])
+                vals = gpu_tensor([bias[w] for w in words])
+                logits.scatter_add_(0, ids, vals)
+
+        k = min(TOP_K, len(logits))
+        vals, ids = torch.topk(logits, k=k)
+        p = torch.softmax(vals / TEMP, dim=0)
+        selected = torch.multinomial(p, 1)
+        return self.inv[int(ids[selected].item())]
+
+    def generate(self, prompt, biasfn=None):
+        out = [BOS, BOS, *tokenize(prompt)]
+
+        for i in range(MAX_NEW):
+            bias = biasfn(out) if biasfn and i % 8 == 0 else None
+            x = self.sample(out, bias)
+            out.append(x)
+
+            if x == EOS:
+                break
+
+        return " ".join(x for x in out if x not in SPECIAL)
+
+    def save(self):
+        Path(MODEL_PATH).write_text(
+            json.dumps(
+                {
+                    "vocab": self.inv,
+                    "uni": dict(self.uni),
+                    "bi": {str(k): dict(v) for k, v in self.bi.items()},
+                    "tri": {str(k): dict(v) for k, v in self.tri.items()},
+                },
+                indent=2,
+            ),
+            encoding="utf8",
+        )
+
+
+def model_bias(model, seeds):
+    return model.bias_from(seeds)
+
+
+def _local_peaks(values: List[float], bins: int = 16):
+    if not values:
+        return [], 0.0, 1.0
+
+    mn, mx = min(values), max(values)
+    span = (mx - mn) or 1.0
+    hist = [0] * bins
+
+    for v in values:
+        b = min(bins - 1, int((v - mn) / span * bins))
+        hist[b] += 1
+
+    peaks = []
+    for i in range(bins):
+        prev = hist[i - 1] if i > 0 else -1
+        nxt = hist[i + 1] if i < bins - 1 else -1
+        if hist[i] >= prev and hist[i] >= nxt and hist[i] > 0:
+            peaks.append(
+                (mn + (i + 0.5) / bins * span, hist[i])
+            )
+
+    return peaks, mn, mx
+
+
+def build_connectome(
+    bindings: Bindings,
+    vocab_size: int = 45,
+    k: int = 3,
+) -> Tuple[go.Figure, str]:
+    if not bindings.contexts:
+        return (
+            go.Figure(),
+            "Train the filter first (no contexts to build a connectome from).",
+        )
+
+    words_all = list(bindings.contexts)
+    freq_all = {
+        w: sum(bindings.contexts[w].values())
+        for w in words_all
+    }
+
+    words = sorted(
+        words_all,
+        key=lambda w: freq_all[w],
+        reverse=True,
+    )[:vocab_size]
+
+    vecs = gpu_tensor([
+        [float(bindings.contexts[w].get(k2, 0.0)) for k2 in words]
+        for w in words
+    ])
+
+    dist = torch.cdist(vecs, vecs, p=1.0)
+    n = len(words)
+
+    if n <= 1:
+        return go.Figure(), "Need at least two connectome nodes."
+
+    kk = min(k, n - 1)
+
+    dist_filled = dist.clone()
+    dist_filled.fill_diagonal_(float("inf"))
+
+    nn_vals, nn_idx = torch.topk(
+        dist_filled,
+        k=kk,
+        largest=False,
+        dim=1,
+    )
+
+    edges = set()
+    idx_cpu = nn_idx.detach().cpu()
+    for i in range(n):
+        for j in idx_cpu[i].tolist():
+            key = (i, j) if i < j else (j, i)
+            edges.add(key)
+
+    freq_gpu = gpu_tensor([freq_all[w] for w in words])
+
+    mean_nn = nn_vals.mean(dim=1)
+
+    sorted_nn, _ = torch.sort(nn_vals, dim=1)
+    z_literal = torch.log(torch.exp(sorted_nn))
+    z_med = z_literal[:, kk // 2]
+
+    def norm(t):
+        mn = t.min()
+        mx = t.max()
+        if float((mx - mn).item()) > 1e-9:
+            return (t - mn) / (mx - mn)
+        return torch.full_like(t, 0.5)
+
+    xN = norm(torch.log1p(freq_gpu)).detach().cpu().tolist()
+    yN = norm(mean_nn).detach().cpu().tolist()
+    zN = norm(z_med).detach().cpu().tolist()
+    freq = freq_gpu.detach().cpu().tolist()
+
+    fig = go.Figure()
+
+    ex, ey, ez = [], [], []
+    for i, j in edges:
+        ex += [xN[i], xN[j], None]
+        ey += [yN[i], yN[j], None]
+        ez += [zN[i], zN[j], None]
+
+    fig.add_trace(
+        go.Scatter3d(
+            x=ex,
+            y=ey,
+            z=ez,
+            mode="lines",
+            line=dict(color="rgba(120,140,160,.55)", width=2),
+            name=f"sparse Manhattan edges (k={kk})",
+            hoverinfo="skip",
+        )
+    )
+
+    max_freq = max(freq) if freq else 1.0
+
+    fig.add_trace(
+        go.Scatter3d(
+            x=xN,
+            y=yN,
+            z=zN,
+            mode="markers+text",
+            marker=dict(
+                size=[6 + 10 * (f / max_freq) for f in freq],
+                color=zN,
+                colorscale="Tealrose",
+                showscale=True,
+                colorbar=dict(title="z (sorted dist.)"),
+                line=dict(color="black", width=0.5),
+            ),
+            text=words,
+            textposition="top center",
+            textfont=dict(size=9),
+            hovertemplate=(
+                "%{text}<br>freq=%{customdata[0]}"
+                "<br>x=%{x:.2f} y=%{y:.2f} z=%{z:.2f}<extra></extra>"
+            ),
+            customdata=[[freq_all[w]] for w in words],
+            name="tokens",
+        )
+    )
+
+    xpeaks, _, _ = _local_peaks(xN)
+    if len(xpeaks) > 1:
+        xpeaks.sort(key=lambda p: p[0])
+        fig.add_trace(
+            go.Scatter3d(
+                x=[p[0] for p in xpeaks],
+                y=[0.0] * len(xpeaks),
+                z=[0.0] * len(xpeaks),
+                mode="lines+markers",
+                line=dict(color="#e7a45c", width=5),
+                marker=dict(size=4, color="#e7a45c"),
+                name="x-axis peak envelope",
+            )
+        )
+
+    ypeaks, _, _ = _local_peaks(yN)
+    if len(ypeaks) > 1:
+        ypeaks.sort(key=lambda p: p[0])
+        fig.add_trace(
+            go.Scatter3d(
+                x=[0.0] * len(ypeaks),
+                y=[p[0] for p in ypeaks],
+                z=[0.0] * len(ypeaks),
+                mode="lines+markers",
+                line=dict(color="#c77dd2", width=5),
+                marker=dict(size=4, color="#c77dd2"),
+                name="y-axis peak envelope",
+            )
+        )
+
+    fig.update_layout(
+        template="plotly_dark",
+        scene=dict(
+            xaxis_title="x: frequency (log, normalized)",
+            yaxis_title="y: mean neighbour distance (normalized)",
+            zaxis_title="z: sorted per-node distance",
+        ),
+        margin=dict(l=0, r=0, t=30, b=0),
+        legend=dict(orientation="h", y=-0.05),
+        height=650,
+    )
+
+    summary = (
+        f"Nodes: {n} · sparse edges: {len(edges)} "
+        f"(k={kk}) · x-peaks: {len(xpeaks)} · "
+        f"y-peaks: {len(ypeaks)} · device: {DEVICE}"
+    )
+
+    return fig, summary
+
+
+_YOLO_MODEL = None
+YOLO_WEIGHTS = "yolov8n.pt"
+
+
+def get_yolo_model(weights: str = YOLO_WEIGHTS):
+    global _YOLO_MODEL
+    if _YOLO_MODEL is None:
+        from ultralytics import YOLO
+        _YOLO_MODEL = YOLO(weights)
+    return _YOLO_MODEL
+
+
+def model_class_signal(weights: str = YOLO_WEIGHTS) -> Counter:
+    model = get_yolo_model(weights)
+    ids = list(model.names)
+    n = len(ids) or 1
+    return Counter(
+        {
+            str(cid): (n - rank) / n
+            for rank, cid in enumerate(sorted(ids))
+        }
+    )
+
+
+def fold_model_signal_into_bindings(
+    bindings: Bindings,
+    class_signal: Counter,
+) -> Bindings:
+    ids = list(class_signal)
+    incoming = defaultdict(Counter)
+
+    # This remains sparse enough for the default YOLO class table.
+    for i, a in enumerate(ids):
+        for j, b in enumerate(ids):
+            if i != j:
+                incoming[a][b] += class_signal[a] * class_signal[b]
+
+    if bindings.contexts:
+        merged = defaultdict(Counter)
+
+        for w, v in bindings.contexts.items():
+            merged[w].update(v)
+
+        for w, v in incoming.items():
+            for k, x in v.items():
+                merged[w][k] = (
+                    bindings.momentum * merged[w][k]
+                    + (1.0 - bindings.momentum) * x
+                )
+
+        bindings.contexts = dict(merged)
+    else:
+        bindings.contexts = dict(incoming)
+
+    bindings.rebuild()
+    return bindings
+
+
+def _sequence_peaks(arr: List[float]) -> List[int]:
+    n = len(arr)
+    peaks = []
+
+    for i in range(n):
+        prev = arr[i - 1] if i > 0 else -1.0
+        nxt = arr[i + 1] if i < n - 1 else -1.0
+        if arr[i] >= prev and arr[i] >= nxt and arr[i] > 0:
+            peaks.append(i)
+
+    return peaks
+
+
+def cross_correlate_peaks(
+    text_freq: Counter,
+    yolo_freq: Counter,
+    top_n: int = 60,
+):
+    vocab = set(text_freq) | set(yolo_freq)
+
+    if not vocab or not text_freq or not yolo_freq:
+        return {}, (
+            "Need both a trained text corpus and a YOLO class-id signal."
+        )
+
+    ranked = sorted(
+        vocab,
+        key=lambda w: text_freq.get(w, 0)
+        + yolo_freq.get(w, 0.0),
+        reverse=True,
+    )[:top_n]
+
+    n = len(ranked)
+
+    text_cpu = [
+        float(text_freq.get(w, 0))
+        for w in ranked
+    ]
+    yolo_cpu = [
+        float(yolo_freq.get(w, 0.0))
+        for w in ranked
+    ]
+
+    # The numerical cross-correlation itself is CUDA-only.
+    a = torch.tensor(
+        text_cpu,
+        dtype=torch.float32,
+        device=DEVICE,
+    )
+    b = torch.tensor(
+        yolo_cpu,
+        dtype=torch.float32,
+        device=DEVICE,
+    )
+
+    a = a / a.max().clamp_min(1e-12)
+    b = b / b.max().clamp_min(1e-12)
+
+    a = a - a.mean()
+    b = b - b.mean()
+
+    full = torch.nn.functional.conv1d(
+        a.view(1, 1, -1),
+        b.flip(0).view(1, 1, -1),
+        padding=n - 1,
+    ).flatten()
+
+    best_i = int(torch.argmax(full).item())
+    best_lag = best_i - (n - 1)
+
+    denom = (
+        torch.linalg.vector_norm(a)
+        * torch.linalg.vector_norm(b)
+    ).clamp_min(1e-12)
+
+    corr_coef = float((full[best_i] / denom).item())
+
+    tx = a.detach().cpu().tolist()
+    ty = b.detach().cpu().tolist()
+
+    text_peaks = set(_sequence_peaks(tx))
+    yolo_peaks = set(_sequence_peaks(ty))
+
+    shifted_yolo_peaks = {
+        p + best_lag
+        for p in yolo_peaks
+    }
+
+    co_peak_idx = {
+        i
+        for i in text_peaks
+        if any(
+            abs(i - p) <= 1
+            for p in shifted_yolo_peaks
+        )
+    }
+
+    bias = {
+        ranked[i]: (
+            max(0.0, tx[i]) + max(0.0, ty[i])
+        ) * XCORR_WEIGHT
+        for i in co_peak_idx
+    }
+
+    top_words = sorted(
+        bias,
+        key=bias.get,
+        reverse=True,
+    )[:10]
+
+    summary = (
+        f"Cross-correlated {len(text_freq)} text words × "
+        f"{len(yolo_freq)} YOLO labels over {n} ranked terms · "
+        f"best lag={best_lag} · corr={corr_coef:.3f} · "
+        f"{len(co_peak_idx)} co-peak words: "
+        f"{', '.join(top_words) if top_words else 'none'}"
+    )
+
+    return bias, summary
+
+
+class State:
+    def __init__(self):
+        self.model = None
+        self.corpus = None
+        self.bindings = Bindings()
+        self.text_freq = Counter()
+        self.yolo_freq = Counter()
+
+    def train(self, text):
+        self.model = NGram().ingest(text)
+        self.model.save()
+
+        self.bindings = Bindings()
+        self.bindings.update(text)
+        self.bindings.save()
+
+        self.corpus = Corpus(text, self.bindings)
+        self.text_freq = Counter(
+            w
+            for w in tokenize(text)
+            if w not in SPECIAL
+        )
+
+
+S = State()
+
+
+def train(file):
+    if file is None:
+        return "No file", "", ""
+
+    path = Path(getattr(file, "name", file))
+    text = path.read_text(
+        encoding="utf8",
+        errors="replace",
+    )
+
+    S.train(text)
+
+    return (
+        "CUDA Automorphism Filter Trained",
+        text[:1000],
+        S.bindings.summary(),
+    )
+
+
+def generate(prompt, vocab_size=45, k=3):
+    if not S.model:
+        return (
+            "Train filter first",
+            "",
+            "",
+            go.Figure(),
+            "",
+            "",
+        )
+
+    if not S.yolo_freq:
+        S.yolo_freq = model_class_signal()
+
+        fold_model_signal_into_bindings(
+            S.bindings,
+            S.yolo_freq,
+        )
+
+        visual_text = " ".join(
+            f"{cid}."
+            for cid in S.yolo_freq
+        )
+
+        S.model.ingest(visual_text)
+        S.model.save()
+
+        ss = sentences(visual_text)
+        freq = Counter(s.lower() for s in ss)
+        start = len(S.corpus.refs)
+
+        for i, s in enumerate(ss):
+            t = tokenize(s)
+            f = S.corpus.bindings.expand(
+                {k2: float(v) for k2, v in bow(t).items()}
+            )
+            S.corpus.refs.append(
+                Ref(
+                    start + i,
+                    s,
+                    t,
+                    freq[s.lower()],
+                    f,
+                )
+            )
+
+    target = S.corpus.bindings.expand(
+        {
+            k2: float(v)
+            for k2, v in bow(tokenize(prompt)).items()
+        }
+    )
+
+    peak_bias, xcorr_summary = cross_correlate_peaks(
+        S.text_freq,
+        S.yolo_freq,
+    )
+
+    state = dict(target)
+
+    for w, sc in peak_bias.items():
+        state[w] = state.get(w, 0.0) + sc
+
+    def bias(history):
+        seeds = sorted(
+            state,
+            key=lambda x: (
+                state[x] * S.corpus.bindings.threshold
+            ),
+            reverse=True,
+        )[:12]
+
+        return model_bias(S.model, seeds)
+
+    text = S.model.generate(prompt, bias)
+
+    fig, conn_summary = build_connectome(
+        S.bindings,
+        int(vocab_size),
+        int(k),
+    )
+
+    return (
+        f"CUDA device: {torch.cuda.get_device_name(0)}",
+        format_matches(S.corpus.search(prompt)),
+        text,
+        fig,
+        conn_summary,
+        xcorr_summary,
+    )
+
+
+def format_matches(rows):
+    return "\n".join(
+        f"{x.rank}. {x.ref.s} score={x.score:.3f} "
+        f"vector={x.vector:.3f}"
+        + (" [subset]" if x.selected else " [endpoint]")
+        for x in rows
+    ) or "No matches."
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--share", action="store_true")
+    p.add_argument("--server-name", default="127.0.0.1")
+    p.add_argument("--server-port", type=int, default=7860)
+    a = p.parse_args()
+
+    import gradio as gr
+
+    # Hard runtime guard: every torch tensor used by the application must be CUDA.
+    assert DEVICE.type == "cuda"
+    torch.cuda.synchronize()
+
+    with gr.Blocks(
+        title="CUDA Bijective Automorphism Filter"
+    ) as ui:
+        gr.Markdown(
+            "# CUDA-only Bijective Automorphism Filter\n"
+            f"GPU: `{torch.cuda.get_device_name(0)}`"
+        )
+
+        gr.Markdown("## Corpus Ingestion")
+
+        corpus_file = gr.File(
+            label="Corpus File (.txt)",
+            file_types=["file"],
+        )
+
+        train_button = gr.Button(
+            "Train Automorphism Filter",
+            variant="primary",
+        )
+
+        training_status = gr.Textbox(
+            label="Status",
+            lines=2,
+        )
+
+        corpus_preview = gr.Textbox(
+            label="Preview",
+            lines=6,
+        )
+
+        binding_summary = gr.Textbox(
+            label="GPU Automorphism Summary",
+            lines=5,
+        )
+
+        train_button.click(
+            fn=train,
+            inputs=[corpus_file],
+            outputs=[
+                training_status,
+                corpus_preview,
+                binding_summary,
+            ],
+        )
+
+        gr.Markdown("## Generate")
+
+        gr.Markdown(
+            "The execution path keeps tensor computation on CUDA: "
+            "GPU cosine similarity, automorphism matrix exponential, "
+            "subset routing, n-gram logits, Manhattan connectome, "
+            "and cross-correlation. YOLO contributes only its built-in "
+            "class-id table; no image pixels are processed."
+        )
+
+        prompt_input = gr.Textbox(
+            label="Filter Seed Prompt",
+            placeholder="Enter a seed phrase...",
+            lines=2,
+        )
+
+        with gr.Row():
+            vocab_slider = gr.Slider(
+                10,
+                100,
+                value=45,
+                step=1,
+                label="Connectome vocab size (top-N tokens)",
+            )
+
+            k_slider = gr.Slider(
+                1,
+                8,
+                value=3,
+                step=1,
+                label="Connectome k-nearest neighbours",
+            )
+
+        generate_button = gr.Button(
+            "Execute Automorphic Stream",
+            variant="primary",
+        )
+
+        generation_status = gr.Textbox(
+            label="CUDA Execution Status",
+            lines=2,
+        )
+
+        corpus_matches = gr.Textbox(
+            label="Subset-sum Filter Matches",
+            lines=8,
+        )
+
+        generated_text = gr.Textbox(
+            label="Automorphically Filtered Series Output",
+            lines=8,
+        )
+
+        connectome_plot = gr.Plot(
+            label="Sparse Manhattan Connectome"
+        )
+
+        connectome_summary = gr.Textbox(
+            label="Connectome Summary",
+            lines=2,
+        )
+
+        xcorr_summary = gr.Textbox(
+            label="Model-Data <-> Corpus Peak Cross-Correlation",
+            lines=2,
+        )
+
+        generate_button.click(
+            fn=generate,
+            inputs=[
+                prompt_input,
+                vocab_slider,
+                k_slider,
+            ],
+            outputs=[
+                generation_status,
+                corpus_matches,
+                generated_text,
+                connectome_plot,
+                connectome_summary,
+                xcorr_summary,
+            ],
+        )
+
+        ui.launch(
+            server_name=a.server_name,
+            server_port=a.server_port,
+            share=a.share,
+        )
+
+
+if __name__ == "__main__":
+    main()

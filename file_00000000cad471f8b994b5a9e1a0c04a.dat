@@ -1,0 +1,304 @@
+
+import re
+import math
+from collections import Counter
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+# =========================
+# Config
+# =========================
+EMBED_DIM = 128
+FEATURE_DIM = 32
+HIDDEN_DIM = 256
+SEQ_LEN = 30
+BATCH_SIZE = 32
+EPOCHS = 10
+LR = 1e-3
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# =========================
+# Load data
+# Replace with your dataset
+# =========================
+TEXTS = [
+    "Hello world. This is a short sentence.",
+    "The quick brown fox jumps over the lazy dog.",
+    "Deep learning models can generate interesting text.",
+    "This example contains many words and demonstrates longer content for training.",
+    "Short text!",
+    "Another example with punctuation, commas, and periods."
+]
+
+# =========================
+# Feature extraction
+# =========================
+def tokenize(text):
+    return re.findall(r"\w+|[^\w\s]", text.lower())
+
+def sigmoid(x):
+    return 1.0 / (1.0 + math.exp(-x))
+
+def extract_features(text):
+    words = re.findall(r"\w+", text)
+    chars = len(text)
+    word_count = len(words)
+
+    avg_word_len = (
+        sum(len(w) for w in words) / max(word_count, 1)
+    )
+
+    punct_count = len(re.findall(r"[^\w\s]", text))
+    punct_ratio = punct_count / max(chars, 1)
+
+    uppercase_ratio = (
+        sum(1 for c in text if c.isupper())
+        / max(chars, 1)
+    )
+
+    lexical_diversity = (
+        len(set(w.lower() for w in words))
+        / max(word_count, 1)
+    )
+
+    raw = np.array([
+        word_count,
+        avg_word_len,
+        punct_ratio,
+        uppercase_ratio,
+        lexical_diversity
+    ], dtype=np.float32)
+
+    sig = np.array(
+        [sigmoid(float(v)) for v in raw],
+        dtype=np.float32
+    )
+
+    ex = np.exp(raw - np.max(raw))
+    soft = ex / ex.sum()
+
+    return np.concatenate([raw, sig, soft]).astype(np.float32)
+
+# =========================
+# Vocabulary
+# =========================
+SPECIAL = ["<pad>", "<unk>", "<bos>", "<eos>"]
+
+counter = Counter()
+for t in TEXTS:
+    counter.update(tokenize(t))
+
+vocab = SPECIAL + sorted(counter.keys())
+
+stoi = {w: i for i, w in enumerate(vocab)}
+itos = {i: w for w, i in stoi.items()}
+
+PAD = stoi["<pad>"]
+UNK = stoi["<unk>"]
+BOS = stoi["<bos>"]
+EOS = stoi["<eos>"]
+
+# =========================
+# Dataset
+# =========================
+class TextDataset(Dataset):
+    def __init__(self, texts):
+        self.samples = []
+
+        for text in texts:
+            feat = extract_features(text)
+
+            ids = [BOS]
+            ids += [stoi.get(t, UNK) for t in tokenize(text)]
+            ids += [EOS]
+
+            for i in range(1, len(ids)):
+                start = max(0, i - SEQ_LEN)
+
+                x = ids[start:i]
+                y = ids[start + 1:i + 1]
+
+                self.samples.append((feat, x, y))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+def collate(batch):
+    feats, xs, ys = zip(*batch)
+
+    m = max(len(x) for x in xs)
+
+    xpad = []
+    ypad = []
+
+    for x, y in zip(xs, ys):
+        pad = m - len(x)
+
+        xpad.append(x + [PAD] * pad)
+        ypad.append(y + [PAD] * pad)
+
+    return (
+        torch.tensor(np.array(feats), dtype=torch.float32),
+        torch.tensor(xpad),
+        torch.tensor(ypad)
+    )
+
+dataset = TextDataset(TEXTS)
+loader = DataLoader(
+    dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    collate_fn=collate
+)
+
+# =========================
+# Model
+# =========================
+class FeatureConditionedGRU(nn.Module):
+    def __init__(self, vocab_size, feature_count):
+        super().__init__()
+
+        self.token_embedding = nn.Embedding(
+            vocab_size,
+            EMBED_DIM,
+            padding_idx=PAD
+        )
+
+        self.feature_projection = nn.Sequential(
+            nn.Linear(feature_count, 64),
+            nn.ReLU(),
+            nn.Linear(64, FEATURE_DIM)
+        )
+
+        self.gru = nn.GRU(
+            EMBED_DIM + FEATURE_DIM,
+            HIDDEN_DIM,
+            batch_first=True
+        )
+
+        self.output = nn.Linear(
+            HIDDEN_DIM,
+            vocab_size
+        )
+
+    def forward(self, features, tokens):
+        tok = self.token_embedding(tokens)
+
+        feat = self.feature_projection(features)
+        feat = feat.unsqueeze(1)
+        feat = feat.repeat(1, tok.size(1), 1)
+
+        combined = torch.cat(
+            [tok, feat],
+            dim=-1
+        )
+
+        out, _ = self.gru(combined)
+
+        return self.output(out)
+
+feature_size = len(extract_features(TEXTS[0]))
+
+model = FeatureConditionedGRU(
+    len(vocab),
+    feature_size
+).to(DEVICE)
+
+criterion = nn.CrossEntropyLoss(
+    ignore_index=PAD
+)
+
+optimizer = torch.optim.Adam(
+    model.parameters(),
+    lr=LR
+)
+
+# =========================
+# Training
+# =========================
+for epoch in range(EPOCHS):
+    model.train()
+
+    total = 0
+
+    for feats, x, y in loader:
+        feats = feats.to(DEVICE)
+        x = x.to(DEVICE)
+        y = y.to(DEVICE)
+
+        optimizer.zero_grad()
+
+        logits = model(feats, x)
+
+        loss = criterion(
+            logits.reshape(-1, len(vocab)),
+            y.reshape(-1)
+        )
+
+        loss.backward()
+        optimizer.step()
+
+        total += loss.item()
+
+    print(
+        f"Epoch {epoch+1}: "
+        f"{total/len(loader):.4f}"
+    )
+
+torch.save(
+    model.state_dict(),
+    "feature_conditioned_gru.pt"
+)
+
+# =========================
+# Generation
+# =========================
+@torch.no_grad()
+def generate(seed_text, max_tokens=40):
+    model.eval()
+
+    feat = torch.tensor(
+        [extract_features(seed_text)],
+        dtype=torch.float32,
+        device=DEVICE
+    )
+
+    current = [BOS]
+
+    for _ in range(max_tokens):
+        x = torch.tensor(
+            [current],
+            device=DEVICE
+        )
+
+        logits = model(feat, x)
+
+        probs = torch.softmax(
+            logits[0, -1],
+            dim=-1
+        )
+
+        nxt = torch.multinomial(
+            probs,
+            1
+        ).item()
+
+        if nxt == EOS:
+            break
+
+        current.append(nxt)
+
+    return " ".join(
+        itos[i]
+        for i in current[1:]
+    )
+
+print()
+print(generate("Short text!"))

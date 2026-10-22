@@ -1,0 +1,251 @@
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+np.set_printoptions(precision=3, suppress=True)
+
+
+def build_matrix(rows, cols, seed):
+    # HARDWARE: the digital values that will be carried by the
+    # entangled laser -- nothing physical yet, this is just the data
+    # to be loaded onto the beam plate.
+    rng = np.random.default_rng(seed)
+    return np.round(rng.uniform(0.0, 1.0, (rows, cols)), 2)
+
+
+def build_binary_filter(rows, cols, seed, p_open=0.5):
+    # HARDWARE: the pattern of valves that sit over each hole in the
+    # beam plate. Each valve is a single 2-D layer that is either
+    # fully OPEN (1, beam passes) or fully SHUT (0, beam blocked).
+    # No grayscale, no duty cycling -- strictly binary, one shot.
+    rng = np.random.default_rng(seed)
+    return (rng.uniform(0.0, 1.0, (rows, cols)) < p_open).astype(float)
+
+
+def encode_same_plane(values, valves):
+    # HARDWARE: entangled laser shines through the beam plate; each
+    # hole's valve either passes the beam untouched or blocks it
+    # completely. No intermediate transmittance is possible.
+    if values.shape != valves.shape:
+        raise ValueError("values and valves must have identical shapes")
+    if not np.all(np.isin(valves, [0.0, 1.0])):
+        raise ValueError("valves must be strictly binary (0 or 1)")
+    return values * valves
+
+
+def fft2c(x):
+    return np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(x)))
+
+
+def ifft2c(x):
+    return np.fft.fftshift(np.fft.ifft2(np.fft.ifftshift(x)))
+
+
+def make_joint_plane(A, B, separation):
+    m, p = A.shape
+    p2, n = B.shape
+    if p != p2:
+        raise ValueError(f"A shape {A.shape} and B shape {B.shape} are incompatible")
+    width = separation + n
+    height = max(m, p)
+    plane = np.zeros((height, width), dtype=float)
+    A_plane = np.zeros_like(plane)
+    B_plane = np.zeros_like(plane)
+    A_plane[:m, :p] = A
+    B_plane[:p, separation:separation + n] = B
+    plane = A_plane + B_plane
+    return plane, A_plane, B_plane
+
+
+def balanced_joint_transform(A, B, separation):
+    joint, A_plane, B_plane = make_joint_plane(A, B, separation)
+    F_joint = fft2c(joint)
+    joint_power = np.abs(F_joint) ** 2
+    F_A = fft2c(A_plane)
+    F_B = fft2c(B_plane)
+    self_power = np.abs(F_A) ** 2 + np.abs(F_B) ** 2
+    balanced_power = joint_power - self_power
+    cross_spectrum = F_A * np.conj(F_B) + np.conj(F_A) * F_B
+    cross_correlation = np.real(ifft2c(cross_spectrum))
+    return joint, joint_power, balanced_power, cross_correlation
+
+
+def optical_mac_reference(A, B):
+    """Reference for the correctly decoded shared-index optical channels."""
+    m, p = A.shape
+    p2, n = B.shape
+    if p != p2:
+        raise ValueError("inner dimensions must match")
+    channels = np.empty((p, m, n), dtype=float)
+    for j in range(p):
+        channels[j] = A[:, j:j + 1] * B[j:j + 1, :]
+    return channels.sum(axis=0), channels
+
+
+def plot_matrix(fig, ax, data, title, cmap="viridis", vmin=None, vmax=None, annotate=False):
+    image = ax.imshow(
+        data,
+        origin="lower",
+        interpolation="nearest",
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        aspect="auto",
+    )
+    ax.set_title(title)
+    ax.set_xlabel("column")
+    ax.set_ylabel("row")
+    if annotate:
+        for r in range(data.shape[0]):
+            for c in range(data.shape[1]):
+                ax.text(
+                    c, r, f"{data[r, c]:.3f}",
+                    ha="center", va="center",
+                    color="white", fontsize=8,
+                )
+    fig.colorbar(image, ax=ax, shrink=0.78)
+
+
+def run(
+    m=3,
+    p=3,
+    n=3,
+    value_seed_A=7,
+    value_seed_B=11,
+    valve_seed_A=101,
+    valve_seed_B=202,
+    p_open=0.5,
+    separation=8,
+    out_path="same_plane_matrix_multiply_binary.png",
+):
+    # ==============================================================
+    # 1. DIGITAL VALUES BEFORE THE VALVE LAYER
+    # ==============================================================
+    values_A = build_matrix(m, p, value_seed_A)
+    values_B = build_matrix(p, n, value_seed_B)
+
+    # ==============================================================
+    # 2. BINARY VALVE PLANES -- one 2-D layer, each cell strictly 0/1
+    # ==============================================================
+    valves_A = build_binary_filter(m, p, valve_seed_A, p_open)
+    valves_B = build_binary_filter(p, n, valve_seed_B, p_open)
+
+    # ==============================================================
+    # 3. SAME-PLANE ENCODING (values gated by binary valves)
+    # ==============================================================
+    encoded_A = encode_same_plane(values_A, valves_A)
+    encoded_B = encode_same_plane(values_B, valves_B)
+
+    # ==============================================================
+    # 4. DIGITAL RESULT AFTER ENCODING (software ground truth)
+    # ==============================================================
+    digital_C = encoded_A @ encoded_B
+
+    # ==============================================================
+    # 5. JOINT 2-D PLANE AND INTERFERENCE DIAGNOSTIC
+    # ==============================================================
+    joint_plane, joint_power, balanced_power, cross_correlation = balanced_joint_transform(
+        encoded_A, encoded_B, separation,
+    )
+
+    # ==============================================================
+    # 6. SHARED-INDEX OPTICAL MAC REFERENCE
+    # ==============================================================
+    optical_C, channel_products = optical_mac_reference(encoded_A, encoded_B)
+
+    absolute_error = np.abs(digital_C - optical_C)
+    max_error = np.max(absolute_error)
+
+    # how much of each input matrix survives the binary gating
+    kept_fraction_A = valves_A.mean()
+    kept_fraction_B = valves_B.mean()
+
+    print("\n========== DIGITAL VALUES BEFORE VALVES ==========")
+    print("A values:\n", values_A)
+    print("\nB values:\n", values_B)
+
+    print("\n========== BINARY VALVE PLANES (0 = shut, 1 = open) ==========")
+    print("Valves_A:\n", valves_A)
+    print("\nValves_B:\n", valves_B)
+    print(f"\nFraction of A holes open: {kept_fraction_A:.2f}")
+    print(f"Fraction of B holes open: {kept_fraction_B:.2f}")
+
+    print("\n========== SAME-PLANE ENCODING (gated values) ==========")
+    print("T_A = V_A * Valves_A:\n", encoded_A)
+    print("\nT_B = V_B * Valves_B:\n", encoded_B)
+
+    print("\n========== DIGITAL RESULT AFTER MULTIPLICATION ==========")
+    print("C = T_A @ T_B:\n", digital_C)
+
+    print("\n========== OPTICAL SHARED-INDEX MAC RESULT ==========")
+    print(optical_C)
+    print("\nMaximum absolute error (digital vs. optical-model):")
+    print(max_error)
+
+    # ==============================================================
+    # 7. FIGURE
+    # ==============================================================
+    fig, axes = plt.subplots(3, 5, figsize=(20, 12), constrained_layout=True)
+
+    plot_matrix(fig, axes[0, 0], values_A, "DIGITAL BEFORE\nA matrix values",
+                vmin=0.0, vmax=1.0, annotate=True)
+    plot_matrix(fig, axes[0, 1], values_B, "DIGITAL BEFORE\nB matrix values",
+                vmin=0.0, vmax=1.0, annotate=True)
+    axes[0, 2].axis("off")
+    axes[0, 3].axis("off")
+    axes[0, 4].axis("off")
+    axes[0, 2].text(0.5, 0.5, "DIGITAL INPUT\nBEFORE VALVES",
+                     ha="center", va="center", fontsize=15, transform=axes[0, 2].transAxes)
+
+    plot_matrix(fig, axes[1, 0], valves_A, "BINARY VALVE PLANE\nValves_A (0/1 only)",
+                cmap="Greys_r", vmin=0.0, vmax=1.0, annotate=True)
+    plot_matrix(fig, axes[1, 1], valves_B, "BINARY VALVE PLANE\nValves_B (0/1 only)",
+                cmap="Greys_r", vmin=0.0, vmax=1.0, annotate=True)
+    plot_matrix(fig, axes[1, 2], encoded_A, "GATED PLANE A\nT_A = V_A x Valves_A",
+                vmin=0.0, vmax=1.0, annotate=True)
+    plot_matrix(fig, axes[1, 3], encoded_B, "GATED PLANE B\nT_B = V_B x Valves_B",
+                vmin=0.0, vmax=1.0, annotate=True)
+    axes[1, 4].axis("off")
+    axes[1, 4].text(0.5, 0.5, "SINGLE-LAYER\nON/OFF GATING",
+                     ha="center", va="center", fontsize=14, transform=axes[1, 4].transAxes)
+
+    plot_matrix(fig, axes[2, 0], digital_C, "DIGITAL AFTER\nC = T_A @ T_B",
+                cmap="inferno", annotate=True)
+    plot_matrix(fig, axes[2, 1], optical_C, "ACTUAL OPTICAL MAC\nSUM_j T_A[:,j] T_B[j,:]",
+                cmap="inferno", annotate=True)
+    plot_matrix(fig, axes[2, 2], absolute_error, "ABSOLUTE ERROR\n|digital - optical|",
+                cmap="coolwarm", annotate=True)
+    plot_matrix(fig, axes[2, 3], joint_plane, "SINGLE JOINT 2-D PLANE", cmap="viridis")
+    plot_matrix(fig, axes[2, 4], np.abs(cross_correlation),
+                "BALANCED INTERFERENCE\nCROSS-CORRELATION", cmap="inferno")
+
+    fig.suptitle(
+        "Digital Before -> Binary (0/1) Valve Gating -> Digital After -> Optical MAC",
+        fontsize=17,
+    )
+    fig.savefig(out_path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"\nSaved figure to {out_path}")
+
+    return {
+        "values_A": values_A,
+        "values_B": values_B,
+        "valves_A": valves_A,
+        "valves_B": valves_B,
+        "encoded_A": encoded_A,
+        "encoded_B": encoded_B,
+        "digital_C": digital_C,
+        "optical_C": optical_C,
+        "absolute_error": absolute_error,
+        "joint_plane": joint_plane,
+        "joint_power": joint_power,
+        "balanced_power": balanced_power,
+        "cross_correlation": cross_correlation,
+        "channel_products": channel_products,
+    }
+
+
+if __name__ == "__main__":
+    run()

@@ -1,0 +1,54 @@
+Patch idea for invariant_nn.py
+
+Replace the nearest() function with:
+
+def nearest_ids(seed_tri, dataset, model):
+    ids = [dataset.word2id.get(w, 1) for w in seed_tri]
+    x = torch.tensor([ids])
+
+    with torch.no_grad():
+        z = model.encode(x)
+        target = model.transition(z)
+
+    best = None
+    best_score = -1e9
+
+    for sample in dataset.samples[:5000]:
+        cand = torch.tensor([sample[0]])
+        with torch.no_grad():
+            cz = model.encode(cand)
+
+        score = F.cosine_similarity(target, cz).item()
+
+        if score > best_score:
+            best_score = score
+            best = sample[0]
+
+    return list(best)
+
+Add:
+
+def generate_text(seed_words, dataset, model, steps=30):
+    words = list(seed_words)
+
+    for _ in range(steps):
+        tri = words[-3:]
+
+        nxt_ids = nearest_ids(tri, dataset, model)
+        nxt_words = [dataset.id2word[i] for i in nxt_ids]
+
+        words.append(nxt_words[-1])
+
+    return " ".join(words)
+
+And replace:
+
+out = nearest(words[-3:], ds, model)
+print("next invariant state:", out)
+
+with:
+
+out = generate_text(words, ds, model, steps=50)
+print(out)
+
+This generates ~50 additional words by repeatedly predicting the next invariant trigram state and appending the final token.

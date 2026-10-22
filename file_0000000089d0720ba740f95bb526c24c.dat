@@ -1,0 +1,272 @@
+
+# invariant_structural_project.py
+#
+# Research-oriented invariant structural language model prototype.
+# Single-file project skeleton with:
+# - corpus loading
+# - trigram extraction
+# - POS-structure signatures
+# - contrastive invariant training
+# - transition prediction
+# - top-k sampling
+# - repetition penalty
+# - checkpoint save/load
+#
+# Intended as a foundation for experimentation.
+
+import random
+import argparse
+from collections import defaultdict, Counter
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+import nltk
+from nltk import pos_tag
+from nltk.tokenize import word_tokenize
+
+
+def read_text(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read().lower()
+
+
+def trigrams(tokens):
+    return [tuple(tokens[i:i+3]) for i in range(len(tokens)-2)]
+
+
+def signature(tri):
+    return tuple(tag for _, tag in pos_tag(list(tri)))
+
+
+class StructuralDataset(Dataset):
+    def __init__(self, text):
+        tokens = word_tokenize(text)
+        tris = trigrams(tokens)
+
+        self.word2id = {"<pad>": 0, "<unk>": 1}
+        for w in tokens:
+            if w not in self.word2id:
+                self.word2id[w] = len(self.word2id)
+
+        self.id2word = {v: k for k, v in self.word2id.items()}
+        self.samples = []
+        self.buckets = defaultdict(list)
+
+        for tri in tris:
+            ids = [self.word2id[w] for w in tri]
+            sig = signature(tri)
+            self.buckets[sig].append(ids)
+
+        sigs = list(self.buckets.keys())
+
+        for sig in sigs:
+            items = self.buckets[sig]
+            if len(items) < 2:
+                continue
+
+            for i in range(len(items)-1):
+                anchor = items[i]
+                positive = items[i+1]
+
+                other = random.choice([s for s in sigs if s != sig])
+                negative = random.choice(self.buckets[other])
+
+                self.samples.append((anchor, positive, negative))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        a, p, n = self.samples[idx]
+        return (
+            torch.tensor(a),
+            torch.tensor(p),
+            torch.tensor(n),
+        )
+
+
+class Encoder(nn.Module):
+    def __init__(self, vocab, emb=128, hidden=256, latent=64):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab, emb)
+        self.gru = nn.GRU(emb, hidden, batch_first=True)
+        self.proj = nn.Linear(hidden, latent)
+
+    def forward(self, x):
+        e = self.embedding(x)
+        _, h = self.gru(e)
+        z = self.proj(h.squeeze(0))
+        return F.normalize(z, dim=-1)
+
+
+class TransitionNet(nn.Module):
+    def __init__(self, latent=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent, 256),
+            nn.GELU(),
+            nn.Linear(256, latent)
+        )
+
+    def forward(self, z):
+        return self.net(z)
+
+
+class Decoder(nn.Module):
+    def __init__(self, latent, vocab):
+        super().__init__()
+        self.fc = nn.Linear(latent, vocab)
+
+    def forward(self, z):
+        return self.fc(z)
+
+
+class StructuralModel(nn.Module):
+    def __init__(self, vocab_size, latent=64):
+        super().__init__()
+        self.encoder = Encoder(vocab_size, latent=latent)
+        self.transition = TransitionNet(latent)
+        self.decoder = Decoder(latent, vocab_size)
+
+    def encode(self, x):
+        return self.encoder(x)
+
+
+def contrastive(anchor, positive, negative, margin=0.5):
+    pos = 1 - F.cosine_similarity(anchor, positive)
+    neg = 1 - F.cosine_similarity(anchor, negative)
+    return torch.relu(pos - neg + margin).mean()
+
+
+def train(model, loader, epochs=5, lr=1e-3):
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+
+    for epoch in range(epochs):
+        total = 0.0
+
+        for a, p, n in loader:
+            za = model.encode(a)
+            zp = model.encode(p)
+            zn = model.encode(n)
+
+            pred = model.transition(za)
+
+            loss_inv = contrastive(za, zp, zn)
+            loss_trans = F.mse_loss(pred, zp)
+
+            loss = loss_inv + 0.5 * loss_trans
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            total += loss.item()
+
+        print(f"epoch={epoch+1} loss={total/max(1,len(loader)):.4f}")
+
+
+def candidate_states(seed_tri, ds, model, topk=50):
+    ids = [ds.word2id.get(w, 1) for w in seed_tri]
+
+    with torch.no_grad():
+        target = model.transition(
+            model.encode(torch.tensor([ids]))
+        )
+
+    scores = []
+
+    for sample in ds.samples:
+        tri = sample[0]
+
+        with torch.no_grad():
+            z = model.encode(torch.tensor([tri]))
+
+        s = F.cosine_similarity(target, z).item()
+        scores.append((s, tri))
+
+    scores.sort(key=lambda x: x[0], reverse=True)
+    return scores[:topk]
+
+
+def sample_candidate(candidates, ds, recent, temperature=0.9):
+    vals = []
+
+    for score, tri in candidates:
+        word = ds.id2word[tri[-1]]
+        if word in recent:
+            score *= 0.4
+        vals.append(score)
+
+    vals = np.array(vals)
+    vals = vals - vals.max()
+
+    probs = np.exp(vals / temperature)
+    probs /= probs.sum()
+
+    idx = np.random.choice(len(candidates), p=probs)
+    return candidates[idx][1]
+
+
+def generate(seed, ds, model, steps=100):
+    words = seed[:]
+
+    for _ in range(steps):
+        if len(words) < 3:
+            break
+
+        cand = candidate_states(words[-3:], ds, model)
+
+        tri = sample_candidate(
+            cand,
+            ds,
+            set(words[-30:])
+        )
+
+        words.append(ds.id2word[tri[-1]])
+
+    return " ".join(words)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--corpus", required=True)
+    parser.add_argument("--epochs", type=int, default=5)
+    args = parser.parse_args()
+
+    text = read_text(args.corpus)
+
+    ds = StructuralDataset(text)
+    dl = DataLoader(ds, batch_size=64, shuffle=True)
+
+    model = StructuralModel(len(ds.word2id))
+
+    train(model, dl, epochs=args.epochs)
+
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "vocab": ds.word2id,
+        },
+        "invariant_structural.pt"
+    )
+
+    while True:
+        seed = input("seed> ").strip()
+        if seed.lower() == "q":
+            break
+
+        words = seed.split()
+
+        if len(words) < 3:
+            print("Need at least 3 words.")
+            continue
+
+        print(generate(words, ds, model, 150))
+
+
+if __name__ == "__main__":
+    main()

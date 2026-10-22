@@ -1,0 +1,697 @@
+
+#==== llm_core.py ====
+"""
+Wagenknecht-Cartesian LLM (WCLLM)
+=================================
+
+Implementation of the LLM described by the two provided diagrams.
+
+Image 1 -> "syntactic algebra" attention:
+    Domain: Cartesian product A x B of (current-word, next-word) pairs.
+    Weighting: log-sorting + matrix exponential of a pair-influence matrix.
+    Mapping f: A x B -> Y (influence scores) => used as attention weights.
+
+Image 2 -> Wagenknecht 2022 kernel/active-memory architecture:
+    - kernel .......... forward-pass orchestrator (this Module)
+    - active_memory ... residual stream / KV-cache of past activations
+    - UVGs ............ Universal Variable Get   = token embedding
+    - UTGs ............ Universal Template Get   = positional / template embed
+    - ULIs ............ Universal Language Infer = LM head projection
+    - syntactic algebra .. Cartesian-product influence attention (matrix exp)
+    - optimiser/validator . training loop (owned by trainer, not the model)
+    - networking/environment . I/O tokenizer / dataset (owned by app layer)
+
+The model is a small character-level LM so that it trains on CPU in a
+reasonable time on user-uploaded text.
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from typing import List
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+@dataclass
+class WCLLMConfig:
+    vocab_size: int = 128
+    d_model: int = 96
+    n_layers: int = 2
+    n_heads: int = 4
+    block_size: int = 96          # context window
+    dropout: float = 0.1
+    # syntactic-algebra parameters
+    influence_rank: int = 16      # low-rank factorisation of the pair matrix
+    matrix_exp_scale: float = 0.5 # temperature on matrix exponential
+
+
+# ---------------------------------------------------------------------------
+# Character tokenizer  (kept alongside model — "networking/environment")
+# ---------------------------------------------------------------------------
+class CharTokenizer:
+    def __init__(self, text: str = "") -> None:
+        chars = sorted(list(set(text))) if text else []
+        # reserve id 0 as <pad>/<unk>
+        self.itos: List[str] = ["\u0000"] + chars
+        self.stoi = {c: i for i, c in enumerate(self.itos)}
+
+    @property
+    def vocab_size(self) -> int:
+        return len(self.itos)
+
+    def encode(self, s: str) -> List[int]:
+        return [self.stoi.get(c, 0) for c in s]
+
+    def decode(self, ids: List[int]) -> str:
+        return "".join(self.itos[i] if 0 <= i < len(self.itos) else "" for i in ids)
+
+    def state(self) -> dict:
+        return {"itos": self.itos}
+
+    @classmethod
+    def from_state(cls, state: dict) -> "CharTokenizer":
+        tok = cls("")
+        tok.itos = list(state["itos"])
+        tok.stoi = {c: i for i, c in enumerate(tok.itos)}
+        return tok
+
+
+# ---------------------------------------------------------------------------
+# UVGs   — Universal Variable Get  (token embedding)
+# ---------------------------------------------------------------------------
+class UVG(nn.Module):
+    """Fetches the learned vector for each token id (a "universal variable")."""
+
+    def __init__(self, vocab_size: int, d_model: int) -> None:
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, d_model)
+
+    def forward(self, idx: torch.Tensor) -> torch.Tensor:  # (B,T) -> (B,T,D)
+        return self.embed(idx)
+
+
+# ---------------------------------------------------------------------------
+# UTGs   — Universal Template Get  (positional / template embeddings)
+# ---------------------------------------------------------------------------
+class UTG(nn.Module):
+    """Positional template that composes with UVG vectors."""
+
+    def __init__(self, block_size: int, d_model: int) -> None:
+        super().__init__()
+        self.pos = nn.Embedding(block_size, d_model)
+        self.block_size = block_size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:      # (B,T,D)
+        T = x.size(1)
+        pos_ids = torch.arange(T, device=x.device)
+        return x + self.pos(pos_ids)
+
+
+# ---------------------------------------------------------------------------
+# Syntactic Algebra — Cartesian-product influence attention (Image 1)
+# ---------------------------------------------------------------------------
+class SyntacticAlgebra(nn.Module):
+    """
+    Implements the "influence space" from Image 1.
+
+    For a sequence of hidden states H in R^{T x D} we form the Cartesian
+    product H_A x H_B (all token pairs), score each pair with a low-rank
+    bilinear form, apply *log-sorting* (a monotone re-ranking that keeps
+    proportions but tames magnitudes), then feed the T x T matrix through
+    a matrix exponential — producing the influence weights f(a_i, b_j).
+
+    The resulting T x T matrix (causally masked) is used as the attention
+    weighting for a multi-head value projection.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, rank: int, exp_scale: float,
+                 dropout: float) -> None:
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.exp_scale = exp_scale
+
+        # low-rank factors for the pair-influence matrix   (per head)
+        # U, V : (n_heads, d_head, rank)
+        self.U = nn.Parameter(torch.randn(n_heads, self.d_head, rank) * 0.02)
+        self.V = nn.Parameter(torch.randn(n_heads, self.d_head, rank) * 0.02)
+
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    # ---- helpers --------------------------------------------------------
+    @staticmethod
+    def _log_sort(mat: torch.Tensor) -> torch.Tensor:
+        """
+        Log-sorting: signed log1p transform. Preserves order (monotone),
+        preserves sign, compresses magnitude so that matrix_exp is stable.
+        """
+        return torch.sign(mat) * torch.log1p(torch.abs(mat))
+
+    # ---- forward --------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x : (B, T, D)
+        B, T, D = x.shape
+        H, Dh = self.n_heads, self.d_head
+
+        # reshape into (B, H, T, Dh) — the "sets A and B" both come from x
+        xh = x.view(B, T, H, Dh).transpose(1, 2)              # (B,H,T,Dh)
+
+        # low-rank pair scores:
+        #   score(a,b) = (xh_a @ U) . (xh_b @ V)^T          # (T,T) per head
+        UA = torch.einsum("bhtd,hdr->bhtr", xh, self.U)       # (B,H,T,R)
+        VB = torch.einsum("bhtd,hdr->bhtr", xh, self.V)       # (B,H,T,R)
+        raw = torch.einsum("bhir,bhjr->bhij", UA, VB) / math.sqrt(self.d_head)
+
+        # Step 2a: log-sorting
+        logged = self._log_sort(raw)
+
+        # Step 2b: causal mask BEFORE matrix_exp (we only propagate influence
+        # from past tokens onto current tokens).  Set future -> large negative.
+        mask = torch.ones(T, T, device=x.device, dtype=torch.bool).tril()
+        logged = logged.masked_fill(~mask, 0.0)               # 0 on strictly
+                                                              # upper triangle
+        # keep lower-triangular; scale to keep matrix_exp bounded
+        M = logged * self.exp_scale
+
+        # Step 2c: matrix exponential per (batch, head)   -> influence Y
+        # torch.matrix_exp acts on the last two dims.
+        Y = torch.matrix_exp(M)                               # (B,H,T,T)
+
+        # renormalise rows so weights sum to 1  (still causal because upper
+        # triangle of M was 0, but exp(0)=1 so we must zero those first).
+        Y = Y * mask.to(Y.dtype)
+        Y = Y / (Y.sum(dim=-1, keepdim=True) + 1e-8)
+
+        # Step 3: mapping -> attention over values
+        v = self.v_proj(x).view(B, T, H, Dh).transpose(1, 2)  # (B,H,T,Dh)
+        out = Y @ v                                           # (B,H,T,Dh)
+        out = out.transpose(1, 2).contiguous().view(B, T, D)
+        out = self.o_proj(out)
+        return self.dropout(out)
+
+
+# ---------------------------------------------------------------------------
+# Kernel block  — one layer of the Wagenknecht kernel
+# ---------------------------------------------------------------------------
+class KernelBlock(nn.Module):
+    """
+    One kernel step:
+        active_memory  <-  active_memory  +  syntactic_algebra(active_memory)
+        active_memory  <-  active_memory  +  MLP(active_memory)
+    (residual = "modifies exceptions of active memory")
+    """
+
+    def __init__(self, cfg: WCLLMConfig) -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(cfg.d_model)
+        self.syntactic = SyntacticAlgebra(
+            cfg.d_model, cfg.n_heads, cfg.influence_rank,
+            cfg.matrix_exp_scale, cfg.dropout,
+        )
+        self.norm2 = nn.LayerNorm(cfg.d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(cfg.d_model, 4 * cfg.d_model),
+            nn.GELU(),
+            nn.Linear(4 * cfg.d_model, cfg.d_model),
+            nn.Dropout(cfg.dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.syntactic(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+# ---------------------------------------------------------------------------
+# ULIs  — Universal Language Inferences  (LM head)
+# ---------------------------------------------------------------------------
+class ULI(nn.Module):
+    def __init__(self, d_model: int, vocab_size: int) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.proj = nn.Linear(d_model, vocab_size, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(self.norm(x))
+
+
+# ---------------------------------------------------------------------------
+# The full LLM  — "kernel" that orchestrates all modules
+# ---------------------------------------------------------------------------
+class WCLLM(nn.Module):
+    def __init__(self, cfg: WCLLMConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.uvg = UVG(cfg.vocab_size, cfg.d_model)
+        self.utg = UTG(cfg.block_size, cfg.d_model)
+        self.kernel = nn.ModuleList(KernelBlock(cfg) for _ in range(cfg.n_layers))
+        self.uli = ULI(cfg.d_model, cfg.vocab_size)
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(m: nn.Module) -> None:
+        if isinstance(m, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    # ---- forward --------------------------------------------------------
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+        # idx (B,T)   targets (B,T) or None
+        active_memory = self.utg(self.uvg(idx))               # UVG + UTG
+        for block in self.kernel:                             # kernel iteration
+            active_memory = block(active_memory)
+        logits = self.uli(active_memory)                      # ULI  (B,T,V)
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-100,
+            )
+        return logits, loss
+
+    # ---- generation -----------------------------------------------------
+    @torch.no_grad()
+    def generate(self, idx: torch.Tensor, max_new_tokens: int,
+                 temperature: float = 1.0, top_k: int | None = None) -> torch.Tensor:
+        self.eval()
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -self.cfg.block_size:]
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :] / max(1e-6, temperature)
+            if top_k is not None and top_k > 0:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float("inf")
+            probs = F.softmax(logits, dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat([idx, next_id], dim=1)
+        return idx
+
+    def num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+#==== trainer.py ====
+"""
+Optimiser / validator — the training loop that drives the WCLLM kernel.
+Runs in a background thread and streams progress to a shared state dict.
+"""
+from __future__ import annotations
+
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+import torch
+
+from llm_core import WCLLM, WCLLMConfig, CharTokenizer
+
+
+@dataclass
+class TrainState:
+    running: bool = False
+    finished: bool = False
+    epoch: int = 0
+    step: int = 0
+    total_steps: int = 0
+    loss: float = 0.0
+    tokens_per_sec: float = 0.0
+    loss_history: List[dict] = field(default_factory=list)   # [{step,loss}]
+    active_module: str = "idle"       # which Wagenknecht node is "hot"
+    message: str = ""
+    error: Optional[str] = None
+
+
+class Trainer:
+    """
+    Owns exactly one WCLLM + tokenizer at a time.  Thread-safe against the
+    FastAPI event loop because all mutations go through a lock.
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.state = TrainState()
+        self.model: Optional[WCLLM] = None
+        self.tokenizer: Optional[CharTokenizer] = None
+        self.cfg: Optional[WCLLMConfig] = None
+        self.corpus: str = ""
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+
+    # ------------------------------------------------------------------ #
+    # public API
+    # ------------------------------------------------------------------ #
+    def set_corpus(self, text: str) -> dict:
+        with self.lock:
+            self.corpus = text
+            self.tokenizer = CharTokenizer(text)
+            self.model = None
+            self.cfg = None
+            self.state = TrainState(message=f"corpus loaded ({len(text)} chars, "
+                                            f"{self.tokenizer.vocab_size} vocab)")
+        return {"chars": len(text), "vocab_size": self.tokenizer.vocab_size}
+
+    def start(self, epochs: int, batch_size: int, lr: float,
+              block_size: int, d_model: int, n_layers: int,
+              n_heads: int, influence_rank: int) -> None:
+        if not self.corpus or not self.tokenizer:
+            raise RuntimeError("no corpus loaded")
+        if self._thread and self._thread.is_alive():
+            raise RuntimeError("training already in progress")
+
+        cfg = WCLLMConfig(
+            vocab_size=self.tokenizer.vocab_size,
+            d_model=d_model,
+            n_layers=n_layers,
+            n_heads=n_heads,
+            block_size=block_size,
+            influence_rank=influence_rank,
+        )
+        model = WCLLM(cfg)
+
+        with self.lock:
+            self.cfg = cfg
+            self.model = model
+            self.state = TrainState(running=True, message="initialising kernel...")
+
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(epochs, batch_size, lr),
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            s = self.state
+            info = {
+                "running": s.running,
+                "finished": s.finished,
+                "epoch": s.epoch,
+                "step": s.step,
+                "total_steps": s.total_steps,
+                "loss": round(s.loss, 4),
+                "tokens_per_sec": round(s.tokens_per_sec, 1),
+                "loss_history": list(s.loss_history[-200:]),
+                "active_module": s.active_module,
+                "message": s.message,
+                "error": s.error,
+                "model_ready": self.model is not None,
+                "params": self.model.num_params() if self.model else 0,
+                "vocab_size": self.tokenizer.vocab_size if self.tokenizer else 0,
+                "cfg": self.cfg.__dict__ if self.cfg else None,
+                "device": "cpu",
+            }
+        return info
+
+    def generate(self, prompt: str, max_new_tokens: int,
+                 temperature: float, top_k: int) -> str:
+        if self.model is None or self.tokenizer is None:
+            raise RuntimeError("model has not been trained yet")
+        with self.lock:
+            model = self.model
+            tok = self.tokenizer
+        ids = tok.encode(prompt) or [0]
+        idx = torch.tensor([ids], dtype=torch.long)
+        out = model.generate(idx, max_new_tokens=max_new_tokens,
+                             temperature=temperature,
+                             top_k=top_k if top_k > 0 else None)
+        return tok.decode(out[0].tolist())
+
+    # ------------------------------------------------------------------ #
+    # internal training loop
+    # ------------------------------------------------------------------ #
+    def _sample_batch(self, data: torch.Tensor, batch_size: int,
+                      block_size: int):
+        ix = torch.randint(0, data.size(0) - block_size - 1, (batch_size,))
+        x = torch.stack([data[i:i + block_size] for i in ix])
+        y = torch.stack([data[i + 1:i + block_size + 1] for i in ix])
+        return x, y
+
+    def _run(self, epochs: int, batch_size: int, lr: float) -> None:
+        try:
+            assert self.tokenizer is not None and self.model is not None
+            assert self.cfg is not None
+
+            ids = torch.tensor(self.tokenizer.encode(self.corpus),
+                               dtype=torch.long)
+            block_size = self.cfg.block_size
+
+            # steps per epoch = ceil(chars / (batch*block))
+            steps_per_epoch = max(1, ids.size(0) // (batch_size * block_size))
+            total_steps = steps_per_epoch * epochs
+
+            with self.lock:
+                self.state.total_steps = total_steps
+                self.state.message = (f"training • {total_steps} steps • "
+                                      f"lr={lr}")
+
+            opt = torch.optim.AdamW(self.model.parameters(), lr=lr)
+
+            # rotate through the visible Wagenknecht nodes so the UI can
+            # animate them in sync with training progress.
+            nodes = ["kernel", "active_memory", "UVGs", "UTGs",
+                     "syntactic_algebra", "ULIs", "optimiser"]
+
+            self.model.train()
+            step = 0
+            t0 = time.time()
+            for ep in range(epochs):
+                for _ in range(steps_per_epoch):
+                    if self._stop.is_set():
+                        raise KeyboardInterrupt("stopped by user")
+                    xb, yb = self._sample_batch(ids, batch_size, block_size)
+                    _, loss = self.model(xb, yb)
+                    opt.zero_grad(set_to_none=True)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    opt.step()
+
+                    step += 1
+                    dt = time.time() - t0
+                    tps = (step * batch_size * block_size) / max(1e-6, dt)
+
+                    with self.lock:
+                        self.state.step = step
+                        self.state.epoch = ep + 1
+                        self.state.loss = float(loss.item())
+                        self.state.tokens_per_sec = tps
+                        self.state.active_module = nodes[step % len(nodes)]
+                        # keep history bounded
+                        self.state.loss_history.append(
+                            {"step": step, "loss": float(loss.item())}
+                        )
+                        if len(self.state.loss_history) > 1000:
+                            self.state.loss_history = self.state.loss_history[-1000:]
+
+            with self.lock:
+                self.state.running = False
+                self.state.finished = True
+                self.state.active_module = "idle"
+                self.state.message = f"done • final loss {self.state.loss:.4f}"
+
+        except KeyboardInterrupt as e:
+            with self.lock:
+                self.state.running = False
+                self.state.finished = True
+                self.state.message = str(e)
+        except Exception as e:  # pragma: no cover  (surfaced to the UI)
+            with self.lock:
+                self.state.running = False
+                self.state.finished = True
+                self.state.error = f"{type(e).__name__}: {e}"
+                self.state.message = "training failed"
+
+
+# module-level singleton
+trainer = Trainer()
+
+#==== server.py ====
+"""
+FastAPI server for the Wagenknecht-Cartesian LLM (WCLLM).
+
+Endpoints (all under /api):
+    GET   /api/                       health
+    POST  /api/corpus                 upload plain-text corpus  (multipart)
+    POST  /api/corpus/sample          load a built-in sample corpus
+    GET   /api/status                 model / training snapshot
+    POST  /api/train                  start training
+    POST  /api/train/stop             stop training
+    POST  /api/generate               generate text with the trained model
+"""
+from __future__ import annotations
+
+import logging
+import os
+from pathlib import Path
+from typing import Optional
+
+from dotenv import load_dotenv
+from fastapi import APIRouter, FastAPI, File, HTTPException, UploadFile
+from pydantic import BaseModel, Field
+from starlette.middleware.cors import CORSMiddleware
+
+from trainer import trainer
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / ".env")
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("wcllm")
+
+app = FastAPI(title="Wagenknecht-Cartesian LLM")
+api = APIRouter(prefix="/api")
+
+
+# ---------------------------------------------------------------------------
+# schemas
+# ---------------------------------------------------------------------------
+class TrainRequest(BaseModel):
+    epochs: int = Field(3, ge=1, le=200)
+    batch_size: int = Field(16, ge=1, le=256)
+    lr: float = Field(3e-3, gt=0, le=1.0)
+    block_size: int = Field(96, ge=8, le=512)
+    d_model: int = Field(96, ge=16, le=512)
+    n_layers: int = Field(2, ge=1, le=8)
+    n_heads: int = Field(4, ge=1, le=16)
+    influence_rank: int = Field(16, ge=2, le=128)
+
+
+class GenerateRequest(BaseModel):
+    prompt: str = ""
+    max_new_tokens: int = Field(120, ge=1, le=1000)
+    temperature: float = Field(0.9, gt=0, le=3.0)
+    top_k: int = Field(40, ge=0, le=1000)
+
+
+class CorpusSampleRequest(BaseModel):
+    name: str = "tiny_shakespeare"
+
+
+SAMPLES = {
+    "tiny_shakespeare": (
+        "To be, or not to be, that is the question:\n"
+        "Whether 'tis nobler in the mind to suffer\n"
+        "The slings and arrows of outrageous fortune,\n"
+        "Or to take arms against a sea of troubles\n"
+        "And by opposing end them. To die - to sleep,\n"
+        "No more; and by a sleep to say we end\n"
+        "The heart-ache and the thousand natural shocks\n"
+        "That flesh is heir to: 'tis a consummation\n"
+        "Devoutly to be wish'd. To die, to sleep;\n"
+        "To sleep, perchance to dream - ay, there's the rub:\n"
+        "For in that sleep of death what dreams may come,\n"
+        "When we have shuffled off this mortal coil,\n"
+        "Must give us pause. There's the respect\n"
+        "That makes calamity of so long life.\n"
+    ) * 30,
+    "kernel_manifesto": (
+        "The kernel manipulates tries and modifies exceptions of active "
+        "memory using code snippets and documentation to solve problems. "
+        "Universal variable get functions, UVGs, retrieve the meaning of "
+        "each symbol. Universal template get functions, UTGs, fetch the "
+        "positional context. Universal language inferences, ULIs, project "
+        "the influence space back into words. The syntactic algebra "
+        "computes the Cartesian product of word pairs and weights them "
+        "through a matrix exponential.\n"
+    ) * 60,
+}
+
+
+# ---------------------------------------------------------------------------
+# endpoints
+# ---------------------------------------------------------------------------
+@api.get("/")
+async def root():
+    return {"ok": True, "service": "wcllm", "version": "0.1.0"}
+
+
+@api.post("/corpus")
+async def upload_corpus(file: UploadFile = File(...)):
+    raw = await file.read()
+    try:
+        text = raw.decode("utf-8", errors="ignore")
+    except Exception as e:
+        raise HTTPException(400, f"could not decode file: {e}")
+    if len(text.strip()) < 50:
+        raise HTTPException(400, "corpus too small (need at least 50 chars)")
+    info = trainer.set_corpus(text)
+    return {"ok": True, "filename": file.filename, **info}
+
+
+@api.post("/corpus/sample")
+async def load_sample(req: CorpusSampleRequest):
+    if req.name not in SAMPLES:
+        raise HTTPException(404, f"unknown sample '{req.name}'")
+    info = trainer.set_corpus(SAMPLES[req.name])
+    return {"ok": True, "sample": req.name, **info}
+
+
+@api.get("/status")
+async def status():
+    return trainer.snapshot()
+
+
+@api.post("/train")
+async def train(req: TrainRequest):
+    try:
+        trainer.start(
+            epochs=req.epochs,
+            batch_size=req.batch_size,
+            lr=req.lr,
+            block_size=req.block_size,
+            d_model=req.d_model,
+            n_layers=req.n_layers,
+            n_heads=req.n_heads,
+            influence_rank=req.influence_rank,
+        )
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, **trainer.snapshot()}
+
+
+@api.post("/train/stop")
+async def train_stop():
+    trainer.stop()
+    return {"ok": True}
+
+
+@api.post("/generate")
+async def generate(req: GenerateRequest):
+    try:
+        text = trainer.generate(
+            prompt=req.prompt,
+            max_new_tokens=req.max_new_tokens,
+            temperature=req.temperature,
+            top_k=req.top_k,
+        )
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "text": text, "prompt": req.prompt}
+
+
+app.include_router(api)
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)

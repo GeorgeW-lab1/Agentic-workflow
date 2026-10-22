@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+import argparse, json, math, random, re, zipfile
+from collections import Counter, defaultdict
+from pathlib import Path
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+DEVICE=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+SPECIAL=['<pad>','<unk>']
+
+def tokenize(text): return re.findall(r"[A-Za-z0-9_']+|[.,!?;:]", text.lower())
+def detokenize(tokens): return re.sub(r"\s+([.,!?;:])",r"\1",' '.join(tokens)).strip()
+
+def build_vocab(tokens,max_vocab):
+    counts=Counter(tokens); words=[w for w,_ in counts.most_common(max_vocab)]
+    for s in SPECIAL:
+        if s not in words: words.append(s)
+    w2i={w:i for i,w in enumerate(words)}; i2w={i:w for w,i in w2i.items()}
+    return words,w2i,i2w,[w2i.get(t,w2i['<unk>']) for t in tokens]
+
+def trigram_stats(ids):
+    tri=Counter(); ctx=Counter(); cont=defaultdict(Counter)
+    for i in range(len(ids)-2):
+        a,b,c=ids[i:i+3]; tri[(a,b,c)]+=1; ctx[(a,b)]+=1; cont[(a,b)][c]+=1
+    return tri,ctx,cont
+
+def examples_from_counts(cont,k):
+    global_c=Counter()
+    for c in cont.values(): global_c.update(c)
+    gc=[x for x,_ in global_c.most_common()]; out=[]
+    for context,counter in cont.items():
+        cand=[x for x,_ in sorted(counter.items(),key=lambda x:x[1],reverse=True)[:k]]
+        for x in gc:
+            if len(cand)>=k: break
+            if x not in cand: cand.append(x)
+        counts=torch.tensor([counter.get(c,0) for c in cand],dtype=torch.float32)
+        p=counts/counts.sum().clamp_min(1)
+        H=float(-(p*p.clamp_min(1e-12).log()).sum())
+        out.append({'context':context,'candidates':cand,'counts':counts,'probs':p,'footprint':sum(math.comb(int(n),2) for n in counts if n>=2),'entropy':H})
+    return out
+
+def geometry(vocab_size,tri):
+    f=torch.ones(vocab_size)
+    for (_,_,c),n in tri.items(): f[c]+=n
+    r=f.log(); r=(r-r.min())/r.max().clamp_min(1e-8); th=2*math.pi*r; s=1-r
+    return torch.stack([r,th/math.pi,s,f/f.max()],-1)
+
+class SumDiagNet(nn.Module):
+    def __init__(self,vocab,geom,embed=96,hidden=192):
+        super().__init__(); self.vocab=vocab; self.register_buffer('geometry',geom)
+        self.embedding=nn.Embedding(vocab,embed)
+        self.genc=nn.Sequential(nn.Linear(4,embed),nn.GELU(),nn.Linear(embed,embed))
+        self.ctx=nn.Sequential(nn.Linear(embed,hidden),nn.GELU(),nn.Linear(hidden,hidden),nn.GELU())
+        self.out=nn.Linear(hidden,vocab)
+        self.sigma=nn.Sequential(nn.Linear(4,32),nn.GELU(),nn.Linear(32,1))
+        self.theta=nn.Sequential(nn.Linear(4,32),nn.GELU(),nn.Linear(32,1))
+        self.rho=nn.Sequential(nn.Linear(4,32),nn.GELU(),nn.Linear(32,1))
+        self.raw_sum=nn.Parameter(torch.tensor(0.0)); self.raw_geo=nn.Parameter(torch.tensor(0.0)); self.raw_temp=nn.Parameter(torch.tensor(0.0))
+        self.register_buffer('W',self.make_W(geom))
+    @property
+    def sum_strength(self): return F.softplus(self.raw_sum)
+    @property
+    def geo_strength(self): return F.softplus(self.raw_geo)
+    @property
+    def temperature(self): return F.softplus(self.raw_temp)+1e-4
+    @staticmethod
+    def diag(x): return torch.diag_embed(x)
+    @staticmethod
+    def make_W(g):
+        r=g[:,0]; t=g[:,1]*math.pi; s=g[:,2]
+        W=torch.exp(-8*(r[:,None]-r[None,:]).square())*.5*(1+torch.cos(t[:,None]-t[None,:]))*torch.exp(-8*(s[:,None]-s[None,:]).square())
+        W.fill_diagonal_(0); return W/W.sum(-1,keepdim=True).clamp_min(1e-8)
+    def forward(self,context,candidates):
+        # context [B,2], candidates [B,K]
+        ce=self.embedding(context).sum(1); ge=self.genc(self.geometry[context]).sum(1)
+        z=torch.gather(self.out(self.ctx(ce+ge)),1,candidates); B,K=candidates.shape
+        # Candidate-only relation matrix: [B,K,K], valid for bmm.
+        W=self.W[candidates]
+        W=torch.gather(W,2,candidates[:,None,:].expand(-1,K,-1))
+        z=z+self.sum_strength*torch.bmm(W,z.unsqueeze(-1)).squeeze(-1)
+        cg=self.geometry[context].mean(1); q=self.geometry[candidates]
+        dr=q[...,0]-cg[:,None,0]; dt=(q[...,1]-cg[:,None,1])*math.pi; ds=q[...,2]-cg[:,None,2]
+        gr=torch.exp(-8*dr.square())*.5*(1+torch.cos(dt))*torch.exp(-8*ds.square())
+        z=z+self.geo_strength*gr
+        for net in (self.sigma,self.theta): z=torch.bmm(self.diag(.5+.5*torch.sigmoid(net(q).squeeze(-1))),z.unsqueeze(-1)).squeeze(-1)
+        gate=.5*(1+torch.cos(q[...,1]*math.pi)); gate=F.relu(gate-gate.mean(1,keepdim=True)); gate=gate/gate.amax(1,keepdim=True).clamp_min(1e-8)
+        z=gate*z+(1-gate)*F.relu(z)
+        z=torch.bmm(self.diag(.5+F.softplus(self.rho(q).squeeze(-1))),z.unsqueeze(-1)).squeeze(-1)
+        return z/self.temperature
+
+def metrics(t,p,c):
+    t=t.clamp_min(1e-12); p=p.clamp_min(1e-12); m=.5*(t+p)
+    kl=(t*(t.log()-p.log())).sum(-1); js=.5*(t*(t.log()-m.log())).sum(-1)+.5*(p*(p.log()-m.log())).sum(-1)
+    ht=-(t*t.log()).sum(-1); hp=-(p*p.log()).sum(-1); st=torch.exp(ht.clamp(max=20)); sp=torch.exp(hp.clamp(max=20))
+    N=c.sum(-1).clamp_min(1); pair=N*(N-1)/2; ft=pair*t.square().sum(-1); fp=pair*p.square().sum(-1)
+    ts,_=torch.sort(t,-1,descending=True); ps,_=torch.sort(p,-1,descending=True)
+    spec=(ts-ps).square().mean(-1); cdf=(torch.cumsum(ts,-1)-torch.cumsum(ps,-1)).square().mean(-1)
+    return dict(kl=kl,js=js,ht=ht,hp=hp,st=st,sp=sp,ft=ft,fp=fp,spec=spec,cdf=cdf,el=(ht-hp).square(),fl=(torch.log1p(ft)-torch.log1p(fp)).square())
+
+def loss(m): return m['kl'].mean()+.5*m['js'].mean()+.5*m['el'].mean()+.75*m['fl'].mean()+.5*m['spec'].mean()+.5*m['cdf'].mean()+.5*(torch.log(m['st'])-torch.log(m['sp'])).square().mean()
+
+def train(model,ex,epochs,lr):
+    opt=torch.optim.AdamW(model.parameters(),lr=lr,weight_decay=1e-4); hist=defaultdict(list)
+    for ep in range(epochs):
+        random.shuffle(ex); sums=defaultdict(float)
+        model.train()
+        for e in ex:
+            ctx=torch.tensor([e['context']],device=DEVICE); cand=torch.tensor([e['candidates']],device=DEVICE); t=e['probs'].to(DEVICE)[None,:]; c=e['counts'].to(DEVICE)[None,:]
+            p=F.softmax(model(ctx,cand),-1); mm=metrics(t,p,c); L=loss(mm); opt.zero_grad(set_to_none=True); L.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(),1); opt.step()
+            for k in ('kl','js','ht','hp','ft','fp'): sums[k]+=float(mm[k].mean())
+            sums['loss']+=float(L)
+        n=len(ex)
+        for k,v in sums.items(): hist[k].append(v/n)
+        hist['temperature'].append(float(model.temperature)); hist['sum_strength'].append(float(model.sum_strength)); hist['geo_strength'].append(float(model.geo_strength))
+        print(f'epoch {ep+1:03d} loss={hist["loss"][-1]:.6f} KL={hist["kl"][-1]:.5f} H={hist["ht"][-1]:.4f}->{hist["hp"][-1]:.4f} F={hist["ft"][-1]:.3f}->{hist["fp"][-1]:.3f} T={hist["temperature"][-1]:.4f}')
+    return dict(hist)
+
+@torch.no_grad()
+def generate(model,prompt,w2i,i2w,n,temperature=1.0,top_k=25):
+    model.eval(); ids=[w2i.get(x,w2i['<unk>']) for x in tokenize(prompt)] or [w2i['<unk>']]
+    V=len(w2i)
+    for _ in range(n):
+        ctx=ids[-2:] if len(ids)>=2 else [w2i['<unk>'],ids[-1]]
+        context=torch.tensor([ctx],device=DEVICE); candidates=torch.arange(V,device=DEVICE)[None,:]
+        z=model(context,candidates).squeeze(0)/max(temperature,1e-4)
+        k=min(top_k,V) if top_k else V; val,idx=torch.topk(z,k); nxt=idx[torch.multinomial(F.softmax(val,-1),1)].item(); ids.append(nxt)
+    return detokenize([i2w.get(i,'<unk>') for i in ids])
+
+def plots(hist,out):
+    import matplotlib.pyplot as plt
+    out=Path(out); out.mkdir(parents=True,exist_ok=True)
+    pairs=[('loss','loss','Training objective'),('ht','hp','Entropy used by training'),('ft','fp','Combinatorial footprint used by training'),('temperature',None,'Learned temperature'),('sum_strength','geo_strength','SUM strengths')]
+    for a,b,title in pairs:
+        fig,ax=plt.subplots(figsize=(10,6)); ax.plot(hist[a],label=a)
+        if b: ax.plot(hist[b],label=b)
+        ax.set_title(title); ax.set_xlabel('Epoch'); ax.grid(alpha=.25); ax.legend(); fig.tight_layout(); fig.savefig(out/(title.lower().replace(' ','_')+'.png'),dpi=180); plt.close(fig)
+
+def main():
+    ap=argparse.ArgumentParser(); ap.add_argument('--corpus',required=True); ap.add_argument('--epochs',type=int,default=10); ap.add_argument('--max-vocab',type=int,default=5000); ap.add_argument('--candidate-k',type=int,default=128); ap.add_argument('--embed-dim',type=int,default=96); ap.add_argument('--hidden-dim',type=int,default=192); ap.add_argument('--lr',type=float,default=2e-3); ap.add_argument('--prompt',default='the'); ap.add_argument('--generate',type=int,default=100); ap.add_argument('--generation-temperature',type=float,default=1.0); ap.add_argument('--top-k',type=int,default=25); ap.add_argument('--plot-dir',default='plots'); args=ap.parse_args()
+    random.seed(7); torch.manual_seed(7)
+    text=Path(args.corpus).read_text(encoding='utf-8'); tok=tokenize(text); vocab,w2i,i2w,ids=build_vocab(tok,args.max_vocab); tri,ctx,cont=trigram_stats(ids); ex=examples_from_counts(cont,args.candidate_k)
+    if not ex: raise RuntimeError('No trigram contexts found.')
+    g=geometry(len(vocab),tri).to(DEVICE); model=SumDiagNet(len(vocab),g,args.embed_dim,args.hidden_dim).to(DEVICE)
+    print(f'device={DEVICE} tokens={len(tok):,} vocab={len(vocab):,} contexts={len(ex):,}')
+    hist=train(model,ex,args.epochs,args.lr); plots(hist,args.plot_dir)
+    torch.save({'model_state':model.state_dict(),'vocab':vocab,'word_to_idx':w2i,'geometry':g.cpu(),'history':hist},'sum_diag_generator.pt')
+    if args.generate>0:
+        print('\nGENERATED:\n'+generate(model,args.prompt,w2i,i2w,args.generate,args.generation_temperature,args.top_k))
+    print('\nsaved sum_diag_generator.pt and plots/')
+
+if __name__=='__main__': main()

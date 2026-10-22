@@ -1,0 +1,1570 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+CALIBRATED SUM + DIAG NEURAL NETWORK
+====================================
+
+This version uses the OLD V18-CSNS-G-AR implementation as a teacher.
+
+Pipeline
+--------
+OLD CODE
+    exact legacy walker probabilities
+             |
+             v
+       teacher p_old
+             |
+             | KL / cross entropy
+             v
+NEW BACKPROP NETWORK
+    SUM embeddings
+    + SUM geometry
+    + CSNS W @ logits
+    + DIAG(sigma)
+    + DIAG(theta)
+    + dim-2 ReLU
+    + DIAG(rho)
+    + signed-power
+    + learned temperature
+             |
+             v
+       p_new ≈ p_old
+
+The critical difference from ordinary training is that the new network does
+NOT invent its own probability geometry. It first measures the old model's
+actual probability distribution on the same (w1,w2,candidate) contexts.
+
+Then backpropagation learns to reproduce those probabilities.
+
+The teacher is loaded dynamically from the supplied legacy Python file, so the
+probabilities come from the actual old code rather than a reimplementation.
+
+Example
+-------
+python calibrated_sum_diag_neural.py ^
+    --legacy "exp(1).py" ^
+    --corpus corpus.txt ^
+    --epochs 10 ^
+    --max-teacher 5000 ^
+    --candidate-k 128
+
+Outputs
+-------
+legacy_probability_audit.json
+calibrated_neural_model.pt
+calibration_plots/
+    probability_kl.png
+    probability_js.png
+    probability_top1.png
+    probability_scatter.png
+    teacher_student_entropy.png
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import math
+import random
+import re
+from collections import Counter
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+DEVICE = (
+    torch.device("cuda")
+    if torch.cuda.is_available()
+    else (
+        torch.device("mps")
+        if hasattr(torch.backends, "mps")
+        and torch.backends.mps.is_available()
+        else torch.device("cpu")
+    )
+)
+
+SPECIAL = ["<pad>", "<unk>", "<bos>", "<eos>"]
+
+
+# ============================================================
+# TOKENIZATION
+# ============================================================
+
+def simple_tokenize(text: str) -> List[str]:
+    """
+    Fallback tokenizer only used for locating contexts.
+
+    The legacy engine remains responsible for calculating teacher probabilities.
+    """
+    return re.findall(r"[A-Za-z0-9_']+|[.,!?;:]", text.lower())
+
+
+# ============================================================
+# LEGACY TEACHER
+# ============================================================
+
+def load_legacy(path: str):
+    """
+    Import exp(1).py without executing its __main__ section.
+
+    The exact old implementation therefore remains the probability teacher.
+    """
+    path = str(Path(path).resolve())
+
+    spec = importlib.util.spec_from_file_location(
+        "legacy_v18_teacher",
+        path,
+    )
+
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load legacy file: {path}")
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    return module
+
+
+def build_legacy_engine(legacy, corpus: str):
+    """
+    Build the exact old V18 engine.
+
+    Defaults match the old engine's constructor:
+        syn_weight=2.0
+        trans_weight=0.6
+        syn_k=8
+    """
+    engine = legacy.V18Engine(
+        syn_weight=2.0,
+        trans_weight=0.6,
+        syn_k=8,
+    )
+
+    engine.train(corpus)
+
+    if engine.walker is None:
+        raise RuntimeError("Legacy engine did not produce a walker.")
+
+    return engine
+
+
+# ============================================================
+# TEACHER PROBABILITY AUDIT
+# ============================================================
+
+def normalise_probability(p: torch.Tensor) -> torch.Tensor:
+    p = p.detach().float()
+    p = torch.nan_to_num(
+        p,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    p = p.clamp_min(0.0)
+
+    s = p.sum()
+
+    if not torch.isfinite(s) or s.item() <= 0.0:
+        return torch.full_like(
+            p,
+            1.0 / max(p.numel(), 1),
+        )
+
+    return p / s
+
+
+def collect_teacher_probabilities(
+    engine,
+    corpus: str,
+    max_examples: int,
+) -> List[dict]:
+    """
+    Ask the OLD walker for its actual final probabilities.
+
+    We intentionally use walk_probs(), not the legacy trigram counts directly.
+
+    Therefore every teacher probability contains the old code's complete
+    probability assembly, including:
+        - LM prior
+        - rho/theta/sigma kernels
+        - graph terms
+        - PDN
+        - COT
+        - mandate
+        - tau
+        - influence space
+        - CSNS
+        - old DNN pipeline
+        - old L1 simplex projection
+    """
+    tokens = simple_tokenize(corpus)
+
+    # Convert to the legacy tokenizer's representation where possible.
+    try:
+        tokens = engine.lm.vocab[:0] + legacy_tokenize_from_engine(
+            engine,
+            corpus,
+        )
+    except Exception:
+        pass
+
+    examples = []
+    seen = set()
+
+    for i in range(len(tokens) - 2):
+        w1 = tokens[i]
+        w2 = tokens[i + 1]
+
+        key = (w1, w2)
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        try:
+            cands, probs = engine.walker.walk_probs(
+                w1,
+                w2,
+                temp=1.4,
+                and_weight=0.5,
+            )
+        except Exception:
+            continue
+
+        if not cands or probs is None:
+            continue
+
+        probs = normalise_probability(probs.cpu())
+
+        if len(cands) != probs.numel():
+            continue
+
+        examples.append(
+            {
+                "w1": w1,
+                "w2": w2,
+                "cands": list(cands),
+                "probs": probs.tolist(),
+            }
+        )
+
+        if len(examples) >= max_examples:
+            break
+
+    if not examples:
+        raise RuntimeError(
+            "The legacy walker produced no probability examples."
+        )
+
+    return examples
+
+
+def legacy_tokenize_from_engine(engine, corpus: str) -> List[str]:
+    """
+    Use the exact legacy tokenizer if it exists.
+    """
+    legacy_tokenizer = getattr(
+        engine.__class__,
+        "__legacy_tokenizer_unused__",
+        None,
+    )
+
+    # The old tokenizer is module-level, so retrieve it through the class's
+    # defining module.
+    module = __import__(engine.__class__.__module__)
+
+    if hasattr(module, "tokenize"):
+        return module.tokenize(corpus)
+
+    return simple_tokenize(corpus)
+
+
+# ============================================================
+# VOCABULARY / GEOMETRY
+# ============================================================
+
+def build_vocab_from_legacy(engine) -> Tuple[List[str], Dict[str, int]]:
+    vocab = list(engine.lm.vocab)
+
+    # Ensure all special tokens exist.
+    for token in SPECIAL:
+        if token not in vocab:
+            vocab.insert(0, token)
+
+    tok2idx = {
+        token: i
+        for i, token in enumerate(vocab)
+    }
+
+    return vocab, tok2idx
+
+
+def build_legacy_geometry(
+    engine,
+    vocab: List[str],
+) -> torch.Tensor:
+    """
+    Reuse the exact rho/theta/sigma values already calculated by the old code.
+
+    This is important: the student is not allowed to silently change the
+    geometric coordinate system while learning the probability distribution.
+    """
+    geo = engine.geo
+
+    values = []
+
+    for token in vocab:
+        try:
+            idx = geo._tok2idx[token]
+            rho = float(geo._rho_t[idx].item())
+            theta = float(geo._theta_t[idx].item())
+            sigma = float(geo._sigma_t[idx].item())
+        except Exception:
+            rho = theta = sigma = 0.0
+
+        values.append(
+            [rho, theta / math.pi, sigma, 1.0]
+        )
+
+    return torch.tensor(
+        values,
+        dtype=torch.float32,
+        device=DEVICE,
+    )
+
+
+# ============================================================
+# DISTILLATION DATA
+# ============================================================
+
+class TeacherDataset:
+    def __init__(
+        self,
+        examples: List[dict],
+        tok2idx: Dict[str, int],
+    ):
+        contexts = []
+        candidate_lists = []
+        probability_lists = []
+
+        for ex in examples:
+            w1 = tok2idx.get(ex["w1"], tok2idx["<unk>"])
+            w2 = tok2idx.get(ex["w2"], tok2idx["<unk>"])
+
+            cands = [
+                tok2idx.get(c, tok2idx["<unk>"])
+                for c in ex["cands"]
+            ]
+
+            if len(cands) < 2:
+                continue
+
+            contexts.append([w1, w2])
+            candidate_lists.append(cands)
+            probability_lists.append(ex["probs"])
+
+        self.contexts = contexts
+        self.candidates = candidate_lists
+        self.probs = probability_lists
+
+    def __len__(self):
+        return len(self.contexts)
+
+
+# ============================================================
+# NEW NEURAL NETWORK
+# ============================================================
+
+class CalibratedSumDiagNetwork(nn.Module):
+    """
+    Student network.
+
+    The old probability distribution is the teacher.
+
+    The student keeps the old structural coordinate system but replaces fixed
+    processing with trainable neural parameters.
+
+    Every major old operation has a differentiable counterpart.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        geometry: torch.Tensor,
+        embed_dim: int = 96,
+        hidden_dim: int = 192,
+        lambda_reg: float = 811.0,
+        gamma_side: float = 411.0,
+        syn_k: int = 8,
+    ):
+        super().__init__()
+
+        self.vocab_size = vocab_size
+        self.register_buffer("geometry", geometry)
+
+        self.embedding = nn.Embedding(
+            vocab_size,
+            embed_dim,
+        )
+
+        self.geometry_encoder = nn.Sequential(
+            nn.Linear(4, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+
+        self.context_net = nn.Sequential(
+            nn.Linear(embed_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+        )
+
+        self.raw_head = nn.Linear(
+            hidden_dim,
+            vocab_size,
+        )
+
+        # Learned diagonal fields.
+        self.sigma_gate = nn.Sequential(
+            nn.Linear(4, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
+        )
+
+        self.theta_gate = nn.Sequential(
+            nn.Linear(4, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
+        )
+
+        self.rho_gate = nn.Sequential(
+            nn.Linear(4, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
+        )
+
+        # Learned replacement for old fixed CSNS strengths.
+        self.raw_syn_weight = nn.Parameter(
+            torch.tensor(math.log(math.exp(2.0) - 1.0))
+        )
+
+        self.raw_trans_weight = nn.Parameter(
+            torch.tensor(math.log(math.exp(0.6) - 1.0))
+        )
+
+        # Learned temperature starts at the old generation temperature.
+        self.raw_temperature = nn.Parameter(
+            torch.tensor(math.log(math.exp(1.4) - 1.0))
+        )
+
+        # Learned residual starts at old 0.3 theta residual.
+        self.raw_theta_residual = nn.Parameter(
+            torch.tensor(math.log(math.exp(0.3) - 1.0))
+        )
+
+        # Neural correction is initialized at zero.
+        self.neural_correction = nn.Linear(
+            hidden_dim,
+            vocab_size,
+        )
+
+        nn.init.zeros_(self.neural_correction.weight)
+        nn.init.zeros_(self.neural_correction.bias)
+
+        # Fixed structural kernel is deliberately identical to the old kernel.
+        self.lambda_reg = lambda_reg
+        self.gamma_side = gamma_side
+        self.syn_k = syn_k
+
+        W = self._build_old_kernel(
+            geometry[:, 0],
+            geometry[:, 1] * math.pi,
+            geometry[:, 2],
+        )
+
+        self.register_buffer(
+            "W_syn",
+            W,
+        )
+
+    @property
+    def syn_weight(self):
+        return F.softplus(self.raw_syn_weight)
+
+    @property
+    def trans_weight(self):
+        return F.softplus(self.raw_trans_weight)
+
+    @property
+    def temperature(self):
+        return F.softplus(self.raw_temperature) + 1e-3
+
+    @property
+    def theta_residual(self):
+        return F.softplus(self.raw_theta_residual)
+
+    @staticmethod
+    def diag(gate: torch.Tensor):
+        """
+        Explicit diagonal operator.
+
+        [K]   -> [K,K]
+        [B,K] -> [B,K,K]
+        """
+        if gate.ndim == 1:
+            return torch.diag(gate)
+
+        if gate.ndim == 2:
+            return torch.diag_embed(gate)
+
+        raise ValueError(
+            f"diag requires [K] or [B,K], got {tuple(gate.shape)}"
+        )
+
+    def _build_old_kernel(
+        self,
+        rho: torch.Tensor,
+        theta: torch.Tensor,
+        sigma: torch.Tensor,
+    ):
+        dr = rho[:, None] - rho[None, :]
+        dt = theta[:, None] - theta[None, :]
+        ds = sigma[:, None] - sigma[None, :]
+
+        # Exact old kernel:
+        # k_side * k_ori * k_reg
+        k_side = torch.exp(
+            (-self.gamma_side * ds.square()).clamp(min=-3011.0)
+        )
+
+        k_ori = 0.5 * (
+            1.0 + torch.cos(dt)
+        )
+
+        k_reg = torch.exp(
+            (-self.lambda_reg * dr.square()).clamp(min=-3011.0)
+        )
+
+        W = (
+            k_side
+            * k_ori
+            * k_reg
+        ).clamp(0.0, 1.0)
+
+        W.fill_diagonal_(0.0)
+
+        # Match old row-normalisation.
+        W = W / W.sum(
+            dim=1,
+            keepdim=True,
+        ).clamp_min(1e-8)
+
+        return W
+
+    def local_synaptic_matrix(
+        self,
+        candidate_ids: torch.Tensor,
+    ):
+        B, K = candidate_ids.shape
+
+        W = self.W_syn[candidate_ids]
+
+        W = torch.gather(
+            W,
+            2,
+            candidate_ids.unsqueeze(1).expand(
+                -1,
+                K,
+                -1,
+            ),
+        )
+
+        return W
+
+    def forward(
+        self,
+        context_ids: torch.Tensor,
+        candidate_ids: torch.Tensor,
+    ):
+        B, K = candidate_ids.shape
+
+        # ====================================================
+        # 1. SUM — word embeddings
+        # ====================================================
+        word_h = self.embedding(
+            context_ids
+        ).sum(dim=1)
+
+        # ====================================================
+        # 2. SUM — geometry embeddings
+        # ====================================================
+        geom_h = self.geometry_encoder(
+            self.geometry[context_ids]
+        ).sum(dim=1)
+
+        h = self.context_net(
+            torch.cat(
+                [word_h, geom_h],
+                dim=-1,
+            )
+        )
+
+        # ====================================================
+        # 3. Neural raw logits
+        # ====================================================
+        full_logits = self.raw_head(h)
+
+        correction = self.neural_correction(h)
+
+        full_logits = (
+            full_logits
+            + correction
+        )
+
+        logits = torch.gather(
+            full_logits,
+            1,
+            candidate_ids,
+        )
+
+        # ====================================================
+        # 4. CROSS-SYNAPTIC SUM
+        # ====================================================
+        W = self.local_synaptic_matrix(
+            candidate_ids
+        )
+
+        z_syn = torch.bmm(
+            W,
+            logits.unsqueeze(-1),
+        ).squeeze(-1)
+
+        # ====================================================
+        # 5. TRANSITIVE SUM
+        # ====================================================
+        ctx_geom = (
+            self.geometry[context_ids]
+            .sum(dim=1)
+            / 2.0
+        )
+
+        cand_geom = self.geometry[
+            candidate_ids
+        ]
+
+        dr = (
+            cand_geom[..., 0]
+            - ctx_geom[:, None, 0]
+        )
+
+        dt = (
+            cand_geom[..., 1] * math.pi
+            - ctx_geom[:, None, 1] * math.pi
+        )
+
+        ds = (
+            cand_geom[..., 2]
+            - ctx_geom[:, None, 2]
+        )
+
+        k_side = torch.exp(
+            -self.gamma_side * ds.square()
+        )
+
+        k_ori = 0.5 * (
+            1.0 + torch.cos(dt)
+        )
+
+        k_reg = torch.exp(
+            -self.lambda_reg * dr.square()
+        )
+
+        trans = (
+            k_side
+            * k_ori
+            * k_reg
+        )
+
+        # ====================================================
+        # 6. SUM — old CSNS structure
+        # ====================================================
+        z = (
+            logits
+            + self.trans_weight * trans
+            + self.syn_weight * z_syn
+        )
+
+        # ====================================================
+        # 7. DIAG SIGMA
+        # ====================================================
+        sigma_gate = (
+            0.7
+            + 0.3 * torch.sigmoid(
+                self.sigma_gate(
+                    cand_geom
+                ).squeeze(-1)
+            )
+        )
+
+        D_sigma = self.diag(
+            sigma_gate
+        )
+
+        z1 = torch.bmm(
+            D_sigma,
+            z.unsqueeze(-1),
+        ).squeeze(-1)
+
+        # ====================================================
+        # 8. DIAG THETA
+        # ====================================================
+        theta_gate = (
+            0.5
+            + 0.5 * torch.sigmoid(
+                self.theta_gate(
+                    cand_geom
+                ).squeeze(-1)
+            )
+        )
+
+        D_theta = self.diag(
+            theta_gate
+        )
+
+        z2 = torch.bmm(
+            D_theta,
+            z1.unsqueeze(-1),
+        ).squeeze(-1)
+
+        z2 = (
+            z2
+            + self.theta_residual * logits
+        )
+
+        # ====================================================
+        # 9. DIMENSION-2 RELU
+        # ====================================================
+        theta_w = 0.5 * (
+            1.0
+            + torch.cos(
+                cand_geom[..., 1] * math.pi
+            )
+        )
+
+        gate_raw = F.relu(
+            theta_w
+            - theta_w.mean(
+                dim=1,
+                keepdim=True,
+            )
+        )
+
+        gate = gate_raw / (
+            gate_raw.amax(
+                dim=1,
+                keepdim=True,
+            ).clamp_min(1e-8)
+        )
+
+        z2b = (
+            z2 * gate
+            + F.relu(z2) * (1.0 - gate)
+        )
+
+        # ====================================================
+        # 10. DIAG RHO
+        # ====================================================
+        rho_field = (
+            1.0
+            + F.softplus(
+                self.rho_gate(
+                    cand_geom
+                ).squeeze(-1)
+            )
+        )
+
+        D_rho = self.diag(
+            rho_field
+        )
+
+        z3 = torch.bmm(
+            D_rho,
+            z2b.unsqueeze(-1),
+        ).squeeze(-1)
+
+        # ====================================================
+        # 11. RHO signed power = old p=2
+        # ====================================================
+        z3 = (
+            z3.sign()
+            * z3.abs().clamp(
+                max=3011.0
+            ).pow(2.0)
+        )
+
+        # ====================================================
+        # 12. Learned temperature
+        # ====================================================
+        logits_out = (
+            z3
+            / self.temperature
+        )
+
+        return logits_out
+
+
+# ============================================================
+# CALIBRATION METRICS
+# ============================================================
+
+def kl_divergence(
+    p_teacher: torch.Tensor,
+    logits_student: torch.Tensor,
+):
+    q = F.softmax(
+        logits_student,
+        dim=-1,
+    )
+
+    p = p_teacher.clamp_min(
+        1e-12
+    )
+
+    return (
+        p
+        * (
+            p.log()
+            - q.clamp_min(1e-12).log()
+        )
+    ).sum(dim=-1)
+
+
+def js_divergence(
+    p: torch.Tensor,
+    q: torch.Tensor,
+):
+    p = p.clamp_min(1e-12)
+    q = q.clamp_min(1e-12)
+
+    m = 0.5 * (p + q)
+
+    return 0.5 * (
+        p * (p.log() - m.log())
+    ).sum(dim=-1) + 0.5 * (
+        q * (q.log() - m.log())
+    ).sum(dim=-1)
+
+
+# ============================================================
+# TRAINING
+# ============================================================
+
+def train_student(
+    model: CalibratedSumDiagNetwork,
+    dataset: TeacherDataset,
+    epochs: int,
+    lr: float,
+    alpha_kl: float = 1.0,
+    alpha_ce: float = 0.25,
+):
+    model.train()
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=lr,
+        weight_decay=1e-4,
+    )
+
+    history = {
+        "loss": [],
+        "kl": [],
+        "js": [],
+        "top1": [],
+        "teacher_entropy": [],
+        "student_entropy": [],
+        "temperature": [],
+    }
+
+    for epoch in range(1, epochs + 1):
+        order = list(range(len(dataset)))
+        random.shuffle(order)
+
+        epoch_loss = 0.0
+        epoch_kl = 0.0
+        epoch_js = 0.0
+        epoch_top1 = 0.0
+        epoch_ent_t = 0.0
+        epoch_ent_s = 0.0
+
+        for i in order:
+            context = torch.tensor(
+                [dataset.contexts[i]],
+                dtype=torch.long,
+                device=DEVICE,
+            )
+
+            candidates = torch.tensor(
+                [dataset.candidates[i]],
+                dtype=torch.long,
+                device=DEVICE,
+            )
+
+            teacher = torch.tensor(
+                [dataset.probs[i]],
+                dtype=torch.float32,
+                device=DEVICE,
+            )
+
+            # The old distribution is the target.
+            student_logits = model(
+                context,
+                candidates,
+            )
+
+            student = F.softmax(
+                student_logits,
+                dim=-1,
+            )
+
+            p = teacher.clamp_min(
+                1e-12
+            )
+
+            q = student.clamp_min(
+                1e-12
+            )
+
+            kl = (
+                p
+                * (p.log() - q.log())
+            ).sum()
+
+            # Hard target preserves ordinary next-token learning.
+            target_idx = teacher.argmax(
+                dim=-1
+            )
+
+            ce = F.cross_entropy(
+                student_logits,
+                target_idx,
+            )
+
+            loss = (
+                alpha_kl * kl
+                + alpha_ce * ce
+            )
+
+            optimizer.zero_grad(
+                set_to_none=True
+            )
+
+            loss.backward()
+
+            nn.utils.clip_grad_norm_(
+                model.parameters(),
+                1.0,
+            )
+
+            optimizer.step()
+
+            with torch.no_grad():
+                js = js_divergence(
+                    teacher,
+                    student,
+                ).mean()
+
+                top1 = (
+                    student.argmax(dim=-1)
+                    == teacher.argmax(dim=-1)
+                ).float().mean()
+
+                ent_t = -(
+                    p * p.log()
+                ).sum()
+
+                ent_s = -(
+                    q * q.log()
+                ).sum()
+
+            epoch_loss += float(loss.detach())
+            epoch_kl += float(kl.detach())
+            epoch_js += float(js)
+            epoch_top1 += float(top1)
+            epoch_ent_t += float(ent_t)
+            epoch_ent_s += float(ent_s)
+
+        n = max(len(order), 1)
+
+        history["loss"].append(
+            epoch_loss / n
+        )
+        history["kl"].append(
+            epoch_kl / n
+        )
+        history["js"].append(
+            epoch_js / n
+        )
+        history["top1"].append(
+            epoch_top1 / n
+        )
+        history["teacher_entropy"].append(
+            epoch_ent_t / n
+        )
+        history["student_entropy"].append(
+            epoch_ent_s / n
+        )
+        history["temperature"].append(
+            float(model.temperature.detach().cpu())
+        )
+
+        print(
+            f"epoch {epoch:03d} | "
+            f"loss={history['loss'][-1]:.6f} | "
+            f"KL={history['kl'][-1]:.6f} | "
+            f"JS={history['js'][-1]:.6f} | "
+            f"top1={history['top1'][-1]:.4f} | "
+            f"T={history['temperature'][-1]:.4f}"
+        )
+
+    return history
+
+
+# ============================================================
+# INTERNAL PROBABILITY CHECK
+# ============================================================
+
+@torch.no_grad()
+def audit_teacher_vs_student(
+    model,
+    dataset,
+):
+    model.eval()
+
+    rows = []
+
+    for i in range(len(dataset)):
+        context = torch.tensor(
+            [dataset.contexts[i]],
+            dtype=torch.long,
+            device=DEVICE,
+        )
+
+        candidates = torch.tensor(
+            [dataset.candidates[i]],
+            dtype=torch.long,
+            device=DEVICE,
+        )
+
+        teacher = torch.tensor(
+            [dataset.probs[i]],
+            dtype=torch.float32,
+            device=DEVICE,
+        )
+
+        student_logits = model(
+            context,
+            candidates,
+        )
+
+        student = F.softmax(
+            student_logits,
+            dim=-1,
+        )
+
+        kl = kl_divergence(
+            teacher,
+            student_logits,
+        ).item()
+
+        js = js_divergence(
+            teacher,
+            student,
+        ).item()
+
+        rows.append(
+            {
+                "context": dataset.contexts[i],
+                "teacher_entropy": float(
+                    -(teacher * teacher.clamp_min(1e-12).log()).sum()
+                ),
+                "student_entropy": float(
+                    -(student * student.clamp_min(1e-12).log()).sum()
+                ),
+                "kl": kl,
+                "js": js,
+                "teacher_top1": int(
+                    teacher.argmax().item()
+                ),
+                "student_top1": int(
+                    student.argmax().item()
+                ),
+            }
+        )
+
+    return rows
+
+
+# ============================================================
+# PLOTS
+# ============================================================
+
+def make_plots(
+    history,
+    audit,
+    output_dir,
+):
+    import matplotlib.pyplot as plt
+
+    out = Path(output_dir)
+    out.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # KL
+    fig = plt.figure(figsize=(10, 5))
+    ax = fig.add_subplot(111)
+    ax.plot(
+        history["kl"],
+        label="Teacher → neural KL",
+    )
+    ax.set_title(
+        "Probability calibration: KL divergence"
+    )
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("KL")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(
+        out / "probability_kl.png",
+        dpi=160,
+    )
+    plt.close(fig)
+
+    # JS
+    fig = plt.figure(figsize=(10, 5))
+    ax = fig.add_subplot(111)
+    ax.plot(
+        history["js"],
+        label="Teacher ↔ neural JS",
+    )
+    ax.set_title(
+        "Probability calibration: Jensen-Shannon divergence"
+    )
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("JS")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(
+        out / "probability_js.png",
+        dpi=160,
+    )
+    plt.close(fig)
+
+    # Top-1
+    fig = plt.figure(figsize=(10, 5))
+    ax = fig.add_subplot(111)
+    ax.plot(
+        history["top1"],
+        label="Same top-1 candidate",
+    )
+    ax.set_title(
+        "Teacher vs neural: top-1 agreement"
+    )
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Agreement")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(
+        out / "probability_top1.png",
+        dpi=160,
+    )
+    plt.close(fig)
+
+    # Entropy
+    fig = plt.figure(figsize=(10, 5))
+    ax = fig.add_subplot(111)
+    ax.plot(
+        history["teacher_entropy"],
+        label="Old teacher entropy",
+    )
+    ax.plot(
+        history["student_entropy"],
+        label="New neural entropy",
+    )
+    ax.set_title(
+        "Old vs new probability footprint"
+    )
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Entropy")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(
+        out / "teacher_student_entropy.png",
+        dpi=160,
+    )
+    plt.close(fig)
+
+    # Scatter: old probability against new probability.
+    teacher_probs = []
+    student_probs = []
+
+    for row in audit:
+        # audit stores summary only, so use KL/entropy scatter instead.
+        teacher_probs.append(
+            row["teacher_entropy"]
+        )
+        student_probs.append(
+            row["student_entropy"]
+        )
+
+    fig = plt.figure(figsize=(7, 7))
+    ax = fig.add_subplot(111)
+
+    ax.scatter(
+        teacher_probs,
+        student_probs,
+        s=12,
+        alpha=0.55,
+    )
+
+    lo = min(
+        teacher_probs + student_probs
+    )
+    hi = max(
+        teacher_probs + student_probs
+    )
+
+    ax.plot(
+        [lo, hi],
+        [lo, hi],
+        linestyle="--",
+        label="perfect match",
+    )
+
+    ax.set_title(
+        "Teacher vs neural probability entropy"
+    )
+    ax.set_xlabel("Old probability entropy")
+    ax.set_ylabel("New neural probability entropy")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(
+        out / "probability_scatter.png",
+        dpi=160,
+    )
+    plt.close(fig)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--legacy",
+        required=True,
+        help="Path to the exact old exp(1).py",
+    )
+
+    parser.add_argument(
+        "--corpus",
+        required=True,
+    )
+
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=10,
+    )
+
+    parser.add_argument(
+        "--max-teacher",
+        type=int,
+        default=5000,
+    )
+
+    parser.add_argument(
+        "--embed-dim",
+        type=int,
+        default=96,
+    )
+
+    parser.add_argument(
+        "--hidden-dim",
+        type=int,
+        default=192,
+    )
+
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=2e-3,
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=7,
+    )
+
+    args = parser.parse_args()
+
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    print("=" * 78)
+    print("OLD-PROBABILITY CALIBRATION → NEW SUM+DIAG BACKPROP")
+    print("=" * 78)
+    print(f"device: {DEVICE}")
+    print(f"legacy: {args.legacy}")
+
+    corpus = Path(
+        args.corpus
+    ).read_text(
+        encoding="utf-8"
+    )
+
+    # --------------------------------------------------------
+    # PHASE 1 — EXACT OLD TEACHER
+    # --------------------------------------------------------
+    print("\n[1/5] Loading exact old model...")
+
+    legacy = load_legacy(
+        args.legacy
+    )
+
+    engine = build_legacy_engine(
+        legacy,
+        corpus,
+    )
+
+    # --------------------------------------------------------
+    # PHASE 2 — INTERNAL PROBABILITY MEASUREMENT
+    # --------------------------------------------------------
+    print(
+        "\n[2/5] Measuring OLD probability distributions..."
+    )
+
+    examples = collect_teacher_probabilities(
+        engine,
+        corpus,
+        args.max_teacher,
+    )
+
+    print(
+        f"Measured {len(examples)} old probability distributions."
+    )
+
+    old_entropy = []
+
+    for ex in examples:
+        p = torch.tensor(
+            ex["probs"],
+            dtype=torch.float32,
+        )
+
+        old_entropy.append(
+            float(
+                -(p * p.clamp_min(1e-12).log()).sum()
+            )
+        )
+
+    print(
+        f"OLD mean entropy     = "
+        f"{sum(old_entropy) / max(len(old_entropy),1):.6f}"
+    )
+
+    print(
+        f"OLD mean max-prob    = "
+        f"{sum(max(x['probs']) for x in examples) / max(len(examples),1):.6f}"
+    )
+
+    print(
+        f"OLD probability mass = "
+        f"{sum(sum(x['probs']) for x in examples) / max(len(examples),1):.6f}"
+    )
+
+    with open(
+        "legacy_probability_audit.json",
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(
+            {
+                "num_examples": len(examples),
+                "mean_entropy": (
+                    sum(old_entropy)
+                    / max(len(old_entropy), 1)
+                ),
+                "mean_max_probability": (
+                    sum(
+                        max(x["probs"])
+                        for x in examples
+                    )
+                    / max(len(examples), 1)
+                ),
+                "examples": examples,
+            },
+            f,
+            indent=2,
+        )
+
+    # --------------------------------------------------------
+    # PHASE 3 — EXACT OLD GEOMETRY
+    # --------------------------------------------------------
+    print(
+        "\n[3/5] Building student with OLD geometry..."
+    )
+
+    vocab, tok2idx = build_vocab_from_legacy(
+        engine
+    )
+
+    geometry = build_legacy_geometry(
+        engine,
+        vocab,
+    )
+
+    dataset = TeacherDataset(
+        examples,
+        tok2idx,
+    )
+
+    model = CalibratedSumDiagNetwork(
+        vocab_size=len(vocab),
+        geometry=geometry,
+        embed_dim=args.embed_dim,
+        hidden_dim=args.hidden_dim,
+    ).to(DEVICE)
+
+    print(
+        f"student vocabulary: {len(vocab)}"
+    )
+
+    print(
+        f"teacher examples:   {len(dataset)}"
+    )
+
+    print(
+        f"initial temperature: "
+        f"{model.temperature.item():.6f}"
+    )
+
+    # --------------------------------------------------------
+    # PHASE 4 — BACKPROPAGATE TOWARD OLD PROBS
+    # --------------------------------------------------------
+    print(
+        "\n[4/5] Backpropagating against OLD probabilities..."
+    )
+
+    history = train_student(
+        model,
+        dataset,
+        epochs=args.epochs,
+        lr=args.lr,
+    )
+
+    # --------------------------------------------------------
+    # PHASE 5 — FINAL INTERNAL CHECK
+    # --------------------------------------------------------
+    print(
+        "\n[5/5] Measuring final teacher/student agreement..."
+    )
+
+    audit = audit_teacher_vs_student(
+        model,
+        dataset,
+    )
+
+    mean_kl = (
+        sum(x["kl"] for x in audit)
+        / max(len(audit), 1)
+    )
+
+    mean_js = (
+        sum(x["js"] for x in audit)
+        / max(len(audit), 1)
+    )
+
+    top1 = (
+        sum(
+            x["teacher_top1"]
+            == x["student_top1"]
+            for x in audit
+        )
+        / max(len(audit), 1)
+    )
+
+    print(
+        f"FINAL mean KL        = {mean_kl:.8f}"
+    )
+
+    print(
+        f"FINAL mean JS        = {mean_js:.8f}"
+    )
+
+    print(
+        f"FINAL top-1 agreement= {top1:.4f}"
+    )
+
+    print(
+        f"FINAL temperature     = "
+        f"{model.temperature.item():.6f}"
+    )
+
+    make_plots(
+        history,
+        audit,
+        "calibration_plots",
+    )
+
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "vocab": vocab,
+            "geometry": geometry.cpu(),
+            "history": history,
+            "legacy_probability_mean_entropy": (
+                sum(old_entropy)
+                / max(len(old_entropy), 1)
+            ),
+            "final_mean_kl": mean_kl,
+            "final_mean_js": mean_js,
+            "final_top1_agreement": top1,
+        },
+        "calibrated_sum_diag_neural.pt",
+    )
+
+    print(
+        "\nSaved:"
+    )
+    print(
+        "  legacy_probability_audit.json"
+    )
+    print(
+        "  calibrated_sum_diag_neural.pt"
+    )
+    print(
+        "  calibration_plots/"
+    )
+
+
+if __name__ == "__main__":
+    main()

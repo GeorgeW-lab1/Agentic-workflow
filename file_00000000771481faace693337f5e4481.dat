@@ -1,0 +1,458 @@
+// ============================================================
+// Optimised SHA-256 "two-photon two-valve optical" for Arduino Uno
+// with photodiode inputs (digital in) and light-valve outputs (digital out)
+// plus timing/performance stats
+// ============================================================
+// Target: ATmega328P @ 16 MHz, 2 KB SRAM, 32 KB Flash
+// Style: bit-serial 32-bit ops to mirror the optical machine.
+// ============================================================
+
+#include <avr/pgmspace.h>
+#include <stdint.h>
+
+// ------------------------------------------------------------
+// Pin assignment: two-photon inputs, two-valve outputs
+// ------------------------------------------------------------
+
+// Photodiode inputs (two "photon" channels)
+const uint8_t PHOTON_A_PIN = 2;  // D2
+const uint8_t PHOTON_B_PIN = 3;  // D3
+
+// Light valve control outputs (two "valve" channels)
+const uint8_t VALVE_A_PIN = 8;   // D8
+const uint8_t VALVE_B_PIN = 9;   // D9
+
+// ------------------------------------------------------------
+// Constants (K table in flash)
+// ------------------------------------------------------------
+
+static const uint32_t K[64] PROGMEM = {
+    0x428a2f98UL, 0x71374491UL, 0xb5c0fbcfUL, 0xe9b5dba5UL,
+    0x3956c25bUL, 0x59f111f1UL, 0x923f82a4UL, 0xab1c5ed5UL,
+    0xd807aa98UL, 0x12835b01UL, 0x243185beUL, 0x550c7dc3UL,
+    0x72be5d74UL, 0x80deb1feUL, 0x9bdc06a7UL, 0xc19bf174UL,
+    0xe49b69c1UL, 0xefbe4786UL, 0x0fc19dc6UL, 0x240ca1ccUL,
+    0x2de92c6fUL, 0x4a7484aaUL, 0x5cb0a9dcUL, 0x76f988daUL,
+    0x983e5152UL, 0xa831c66dUL, 0xb00327c8UL, 0xbf597fc7UL,
+    0xc6e00bf3UL, 0xd5a79147UL, 0x06ca6351UL, 0x14292967UL,
+    0x27b70a85UL, 0x2e1b2138UL, 0x4d2c6dfcUL, 0x53380d13UL,
+    0x650a7354UL, 0x766a0abbUL, 0x81c2c92eUL, 0x92722c85UL,
+    0xa2bfe8a1UL, 0xa81a664bUL, 0xc24b8b70UL, 0xc76c51a3UL,
+    0xd192e819UL, 0xd6990624UL, 0xf40e3585UL, 0x106aa070UL,
+    0x19a4c116UL, 0x1e376c08UL, 0x2748774cUL, 0x34b0bcb5UL,
+    0x391c0cb3UL, 0x4ed8aa4aUL, 0x5b9cca4fUL, 0x682e6ff3UL,
+    0x748f82eeUL, 0x78a5636fUL, 0x84c87814UL, 0x8cc70208UL,
+    0x90befffaUL, 0xa4506cebUL, 0xbef9a3f7UL, 0xc67178f2UL
+};
+
+// ------------------------------------------------------------
+// "Optical" backend: bit-serial 32-bit ops (two-valve model)
+// ------------------------------------------------------------
+
+static inline uint32_t AND32(uint32_t a, uint32_t b) {
+    uint32_t result = 0;
+    for (uint8_t slot = 0; slot < 32; ++slot) {
+        uint8_t ai = (a >> slot) & 1U;
+        uint8_t bi = (b >> slot) & 1U;
+        uint8_t v  = ai & bi;
+        result |= (uint32_t)v << slot;
+    }
+    return result;
+}
+
+static inline uint32_t OR32(uint32_t a, uint32_t b) {
+    uint32_t result = 0;
+    for (uint8_t slot = 0; slot < 32; ++slot) {
+        uint8_t ai = (a >> slot) & 1U;
+        uint8_t bi = (b >> slot) & 1U;
+        uint8_t v  = (ai | bi);
+        result |= (uint32_t)v << slot;
+    }
+    return result;
+}
+
+static inline uint32_t XOR32(uint32_t a, uint32_t b) {
+    uint32_t result = 0;
+    for (uint8_t slot = 0; slot < 32; ++slot) {
+        uint8_t ai = (a >> slot) & 1U;
+        uint8_t bi = (b >> slot) & 1U;
+        uint8_t v  = (ai ^ bi);
+        result |= (uint32_t)v << slot;
+    }
+    return result;
+}
+
+static inline uint32_t NOT32(uint32_t a) {
+    return ~a;
+}
+
+static inline uint32_t ADD32(uint32_t a, uint32_t b) {
+    uint32_t result = 0;
+    uint8_t carry = 0;
+    for (uint8_t slot = 0; slot < 32; ++slot) {
+        uint8_t ai = (a >> slot) & 1U;
+        uint8_t bi = (b >> slot) & 1U;
+        uint8_t total = ai + bi + carry;
+        uint8_t out   = total & 1U;
+        carry         = (total >= 2) ? 1U : 0U;
+        result |= (uint32_t)out << slot;
+    }
+    return result;
+}
+
+static inline uint32_t ROTR(uint32_t x, uint8_t n) {
+    n &= 31U;
+    if (n == 0) return x;
+    return (x >> n) | (x << (32U - n));
+}
+
+static inline uint32_t SHR(uint32_t x, uint8_t n) {
+    if (n >= 32) return 0UL;
+    return x >> n;
+}
+
+// ------------------------------------------------------------
+// SHA-256 functions
+// ------------------------------------------------------------
+
+static inline uint32_t Ch(uint32_t x, uint32_t y, uint32_t z) {
+    return XOR32(
+        AND32(x, y),
+        AND32(NOT32(x), z)
+    );
+}
+
+static inline uint32_t Maj(uint32_t x, uint32_t y, uint32_t z) {
+    return XOR32(
+        AND32(x, y),
+        XOR32(
+            AND32(x, z),
+            AND32(y, z)
+        )
+    );
+}
+
+static inline uint32_t Sigma0(uint32_t x) {
+    return XOR32(
+        XOR32(
+            ROTR(x, 2),
+            ROTR(x, 13)
+        ),
+        ROTR(x, 22)
+    );
+}
+
+static inline uint32_t Sigma1(uint32_t x) {
+    return XOR32(
+        XOR32(
+            ROTR(x, 6),
+            ROTR(x, 11)
+        ),
+        ROTR(x, 25)
+    );
+}
+
+static inline uint32_t sigma0(uint32_t x) {
+    return XOR32(
+        XOR32(
+            ROTR(x, 7),
+            ROTR(x, 18)
+        ),
+        SHR(x, 3)
+    );
+}
+
+static inline uint32_t sigma1(uint32_t x) {
+    return XOR32(
+        XOR32(
+            ROTR(x, 17),
+            ROTR(x, 19)
+        ),
+        SHR(x, 10)
+    );
+}
+
+static inline void round_step(
+    uint32_t &a, uint32_t &b, uint32_t &c, uint32_t &d,
+    uint32_t &e, uint32_t &f, uint32_t &g, uint32_t &h,
+    uint32_t k, uint32_t w
+) {
+    uint32_t t1 = ADD32(
+        ADD32(
+            ADD32(
+                ADD32(h, Sigma1(e)),
+                Ch(e, f, g)
+            ),
+            k
+        ),
+        w
+    );
+
+    uint32_t t2 = ADD32(
+        Sigma0(a),
+        Maj(a, b, c)
+    );
+
+    uint32_t new_h = g;
+    uint32_t new_g = f;
+    uint32_t new_f = e;
+    uint32_t new_e = ADD32(d, t1);
+    uint32_t new_d = c;
+    uint32_t new_c = b;
+    uint32_t new_b = a;
+    uint32_t new_a = ADD32(t1, t2);
+
+    a = new_a; b = new_b; c = new_c; d = new_d;
+    e = new_e; f = new_f; g = new_g; h = new_h;
+}
+
+// ------------------------------------------------------------
+// SHA-256 core: single-block compression
+// ------------------------------------------------------------
+
+static void sha256_transform(
+    uint32_t state[8],
+    const uint8_t block[64]
+) {
+    uint32_t w[64];
+
+    for (uint8_t j = 0; j < 16; ++j) {
+        uint32_t word =
+            ((uint32_t)block[j*4 + 0] << 24) |
+            ((uint32_t)block[j*4 + 1] << 16) |
+            ((uint32_t)block[j*4 + 2] <<  8) |
+            ((uint32_t)block[j*4 + 3]      );
+        w[j] = word;
+    }
+
+    for (uint8_t j = 16; j < 64; ++j) {
+        w[j] = ADD32(
+            ADD32(
+                sigma1(w[j - 2]),
+                w[j - 7]
+            ),
+            ADD32(
+                sigma0(w[j - 15]),
+                w[j - 16]
+            )
+        );
+    }
+
+    uint32_t a = state[0];
+    uint32_t b = state[1];
+    uint32_t c = state[2];
+    uint32_t d = state[3];
+    uint32_t e = state[4];
+    uint32_t f = state[5];
+    uint32_t g = state[6];
+    uint32_t h = state[7];
+
+    for (uint8_t j = 0; j < 64; ++j) {
+        uint32_t k = pgm_read_dword(&K[j]);
+        round_step(a, b, c, d, e, f, g, h, k, w[j]);
+    }
+
+    state[0] = ADD32(state[0], a);
+    state[1] = ADD32(state[1], b);
+    state[2] = ADD32(state[2], c);
+    state[3] = ADD32(state[3], d);
+    state[4] = ADD32(state[4], e);
+    state[5] = ADD32(state[5], f);
+    state[6] = ADD32(state[6], g);
+    state[7] = ADD32(state[7], h);
+}
+
+// ------------------------------------------------------------
+// SHA-256 full: padding + multi-block
+// ------------------------------------------------------------
+
+void sha256(const uint8_t *msg, uint32_t msg_len, uint8_t out[32]) {
+    uint32_t state[8] = {
+        0x6a09e667UL,
+        0xbb67ae85UL,
+        0x3c6ef372UL,
+        0xa54ff53aUL,
+        0x510e527fUL,
+        0x9b05688cUL,
+        0x1f83d9abUL,
+        0x5be0cd19UL
+    };
+
+    uint32_t pos = 0;
+    while (pos + 64 <= msg_len) {
+        sha256_transform(state, msg + pos);
+        pos += 64;
+    }
+
+    uint8_t pad[64];
+    uint32_t remaining = msg_len - pos;
+    uint32_t pad_len;
+
+    if (remaining <= 55) {
+        pad_len = 64;
+        for (uint32_t i = 0; i < remaining; ++i) {
+            pad[i] = msg[pos + i];
+        }
+        pad[remaining] = 0x80;
+        for (uint32_t i = remaining + 1; i < 56; ++i) {
+            pad[i] = 0;
+        }
+    } else {
+        pad_len = 128;
+        for (uint32_t i = 0; i < remaining; ++i) {
+            pad[i] = msg[pos + i];
+        }
+        pad[remaining] = 0x80;
+        for (uint32_t i = remaining + 1; i < 64; ++i) {
+            pad[i] = 0;
+        }
+        sha256_transform(state, pad);
+        for (uint32_t i = 0; i < 56; ++i) {
+            pad[i] = 0;
+        }
+    }
+
+    uint64_t bit_len = (uint64_t)msg_len * 8ULL;
+    pad[56] = (bit_len >> 56) & 0xFF;
+    pad[57] = (bit_len >> 48) & 0xFF;
+    pad[58] = (bit_len >> 40) & 0xFF;
+    pad[59] = (bit_len >> 32) & 0xFF;
+    pad[60] = (bit_len >> 24) & 0xFF;
+    pad[61] = (bit_len >> 16) & 0xFF;
+    pad[62] = (bit_len >>  8) & 0xFF;
+    pad[63] = (bit_len      ) & 0xFF;
+
+    sha256_transform(state, pad);
+    if (pad_len == 128) {
+        sha256_transform(state, pad);
+    }
+
+    for (uint8_t i = 0; i < 8; ++i) {
+        out[i*4 + 0] = (state[i] >> 24) & 0xFF;
+        out[i*4 + 1] = (state[i] >> 16) & 0xFF;
+        out[i*4 + 2] = (state[i] >>  8) & 0xFF;
+        out[i*4 + 3] = (state[i]      ) & 0xFF;
+    }
+}
+
+// ------------------------------------------------------------
+// Two-photon input acquisition via digital pins
+// ------------------------------------------------------------
+
+void acquire_two_photon_block(uint8_t block[64]) {
+    for (uint8_t i = 0; i < 64; ++i) {
+        block[i] = 0;
+    }
+
+    uint32_t wordA = 0;
+    uint32_t wordB = 0;
+
+    for (uint8_t slot = 0; slot < 32; ++slot) {
+        uint8_t a_in = digitalRead(PHOTON_A_PIN);
+        uint8_t b_in = digitalRead(PHOTON_B_PIN);
+
+        digitalWrite(VALVE_A_PIN, a_in);
+        digitalWrite(VALVE_B_PIN, b_in);
+
+        wordA |= (uint32_t)a_in << slot;
+        wordB |= (uint32_t)b_in << slot;
+
+        // Adjust slot timing as needed
+        delayMicroseconds(1);
+    }
+
+    block[0] = (wordA >> 24) & 0xFF;
+    block[1] = (wordA >> 16) & 0xFF;
+    block[2] = (wordA >>  8) & 0xFF;
+    block[3] = (wordA      ) & 0xFF;
+
+    block[4] = (wordB >> 24) & 0xFF;
+    block[5] = (wordB >> 16) & 0xFF;
+    block[6] = (wordB >>  8) & 0xFF;
+    block[7] = (wordB      ) & 0xFF;
+}
+
+// ------------------------------------------------------------
+// Arduino sketch: example usage with timing stats
+// ------------------------------------------------------------
+
+void setup() {
+    Serial.begin(115200);
+    while (!Serial) {
+        ; // wait for serial port
+    }
+
+    // Configure photon input pins
+    pinMode(PHOTON_A_PIN, INPUT);
+    pinMode(PHOTON_B_PIN, INPUT);
+
+    // Configure valve output pins
+    pinMode(VALVE_A_PIN, OUTPUT);
+    pinMode(VALVE_B_PIN, OUTPUT);
+
+    // Initialize valves low
+    digitalWrite(VALVE_A_PIN, LOW);
+    digitalWrite(VALVE_B_PIN, LOW);
+
+    // Acquire one 64-byte block from the two-photon system
+    uint8_t block[64];
+
+    uint32_t t0 = micros();
+    uint32_t t_start = t0;
+
+    acquire_two_photon_block(block);
+
+    uint32_t t_after_acquire = micros();
+
+    // Compute SHA-256 of this 64-byte block
+    uint8_t digest[32];
+    sha256(block, 64, digest);
+
+    uint32_t t_after_hash = micros();
+
+    uint32_t t_end = t_after_hash;
+
+    uint32_t t_acquire = t_after_acquire - t_start;
+    uint32_t t_hash    = t_after_hash - t_after_acquire;
+    uint32_t t_total   = t_end - t_start;
+
+    // Print digest as hex
+    Serial.print("Digest: ");
+    for (uint8_t i = 0; i < 32; ++i) {
+        if (digest[i] < 0x10) Serial.print('0');
+        Serial.print(digest[i], HEX);
+    }
+    Serial.println();
+
+    // Print timing stats
+    Serial.print("Time_acquire_us: ");
+    Serial.println(t_acquire);
+
+    Serial.print("Time_hash_us: ");
+    Serial.println(t_hash);
+
+    Serial.print("Time_total_us: ");
+    Serial.println(t_total);
+
+    // Approximate blocks per second (1 block = 64 bytes)
+    // blocks_per_sec = 1e6 / t_total
+    float blocks_per_sec = 0.0f;
+    if (t_total > 0) {
+        blocks_per_sec = 1000000.0f / (float)t_total;
+    }
+
+    Serial.print("Blocks_per_sec: ");
+    Serial.println(blocks_per_sec, 2);
+
+    // Approximate bytes per second
+    float bytes_per_sec = blocks_per_sec * 64.0f;
+    Serial.print("Bytes_per_sec: ");
+    Serial.println(bytes_per_sec, 2);
+}
+
+void loop() {
+    // Nothing here; acquisition + hash runs once in setup().
+    // Move into loop() if you want continuous measurement.
+}
+
+ways to make it even more faster exploiting the photon speed

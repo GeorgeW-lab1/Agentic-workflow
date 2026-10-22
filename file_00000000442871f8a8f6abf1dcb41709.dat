@@ -1,0 +1,160 @@
+// Content script - runs on every webpage to extract text analysis
+
+// Database of services and their identifiers
+const SERVICE_DATABASE = {
+  google: {
+    names: ['google', 'analytics', 'gtag', 'google tag manager'],
+    cookies: ['_ga', '_gat', '_gid', 'NID', '__Secure-ENID'],
+    keywords: ['google analytics', 'gtag', 'google tag manager', 'ga.js', 'analytics.js']
+  },
+  facebook: {
+    names: ['facebook', 'fb', 'meta'],
+    cookies: ['fbp', 'fbc', '_fbp', '_fbc', 'fr', 'datr', 'sb'],
+    keywords: ['facebook pixel', 'facebook conversion', 'fbq', 'facebook.com', 'fb.com']
+  },
+  twitter: {
+    names: ['twitter', 'x.com'],
+    cookies: ['personalization_id', '_twitter_sess', 'auth_token'],
+    keywords: ['twitter', 'x.com', 'tweet button', 'twitter analytics']
+  },
+  linkedin: {
+    names: ['linkedin', 'li.com'],
+    cookies: ['li_gc', 'AnalyticsSyncHistory', 'lms_analytics'],
+    keywords: ['linkedin insight', 'linkedin analytics', 'linkedin pixel']
+  },
+  tiktok: {
+    names: ['tiktok', 'bytedance'],
+    cookies: ['tt_webid', 'tt_webid_v2'],
+    keywords: ['tiktok', 'tiktok pixel', 'bytedance']
+  },
+  pinterest: {
+    names: ['pinterest', 'pin.it'],
+    cookies: ['_pinterest_sess'],
+    keywords: ['pinterest', 'pin.it', 'pinterest pixel']
+  },
+  instagram: {
+    names: ['instagram'],
+    cookies: ['ig_nrcb'],
+    keywords: ['instagram', 'instagram pixel', 'instagram business']
+  },
+  amazon: {
+    names: ['amazon'],
+    cookies: ['ubid-main', 'x-main', 'session-id'],
+    keywords: ['amazon', 'amazon tag', 'amazon associates']
+  },
+  hotjar: {
+    names: ['hotjar'],
+    cookies: ['_hjid', '_hjClosedSurveyInvites', '_hjDonePolls'],
+    keywords: ['hotjar', 'heatmap', 'session recording']
+  },
+  intercom: {
+    names: ['intercom'],
+    cookies: ['intercom-id', 'intercom-session-id'],
+    keywords: ['intercom', 'intercom messenger', 'chat widget']
+  },
+  mixpanel: {
+    names: ['mixpanel'],
+    cookies: ['mp_optout', 'mpeditor'],
+    keywords: ['mixpanel', 'mixpanel analytics', 'mixpanel tracking']
+  },
+  amplitude: {
+    names: ['amplitude'],
+    cookies: ['amplitude_id', 'AMP_MKTAG'],
+    keywords: ['amplitude', 'amplitude analytics', 'amplitude tracking']
+  },
+  segment: {
+    names: ['segment'],
+    cookies: ['ajs_anonymous_id', 'ajs_user_id'],
+    keywords: ['segment.com', 'analytics.js', 'segment analytics']
+  },
+  drift: {
+    names: ['drift'],
+    cookies: ['drift_aid'],
+    keywords: ['drift', 'drift chat', 'drift messaging']
+  },
+  fullstory: {
+    names: ['fullstory'],
+    cookies: ['fs_uid', 'fs_session'],
+    keywords: ['fullstory', 'fullstory session', 'digital experience']
+  },
+  marketo: {
+    names: ['marketo', 'adobe'],
+    cookies: ['_mkto_trk'],
+    keywords: ['marketo', 'lead capture', 'form tracking']
+  },
+  hubspot: {
+    names: ['hubspot'],
+    cookies: ['hubspotutk', '__hstc', '__hssc'],
+    keywords: ['hubspot', 'hubspot form', 'hubspot tracking']
+  },
+  mailchimp: {
+    names: ['mailchimp'],
+    cookies: ['mailchimp_id'],
+    keywords: ['mailchimp', 'mailchimp form', 'email marketing']
+  },
+  sendgrid: {
+    names: ['sendgrid'],
+    cookies: ['sendgrid_tracking'],
+    keywords: ['sendgrid', 'marketing email', 'email provider']
+  },
+  stripe: {
+    names: ['stripe'],
+    cookies: ['__stripe_mid', '__stripe_sid'],
+    keywords: ['stripe', 'stripe payment', 'checkout.stripe.com']
+  },
+  paypal: {
+    names: ['paypal'],
+    cookies: ['login_email', 'enforced_login_required'],
+    keywords: ['paypal', 'paypal checkout', 'paypal express']
+  },
+  adroll: {
+    names: ['adroll', 'rollout'],
+    cookies: ['__adroll'],
+    keywords: ['adroll', 'adroll retargeting', 'remarketing']
+  },
+  quantserve: {
+    names: ['quantserve'],
+    cookies: ['__qca'],
+    keywords: ['quantserve', 'quantcast', 'audience measurement']
+  }
+};
+
+// Extract page text and analyze it
+function analyzePageContent() {
+  // Get all visible text from the page
+  const bodyText = document.body.innerText.toLowerCase();
+  const htmlText = document.documentElement.innerHTML.toLowerCase();
+  
+  // Combine for analysis
+  const fullText = bodyText + ' ' + htmlText;
+  
+  // Find which services are mentioned
+  const detectedServices = {};
+  
+  for (const [serviceName, serviceData] of Object.entries(SERVICE_DATABASE)) {
+    // Check for service names
+    const nameFound = serviceData.names.some(name => fullText.includes(name.toLowerCase()));
+    
+    // Check for specific keywords
+    const keywordsFound = serviceData.keywords.some(keyword => fullText.includes(keyword.toLowerCase()));
+    
+    if (nameFound || keywordsFound) {
+      detectedServices[serviceName] = {
+        confidence: (nameFound && keywordsFound) ? 'high' : 'medium',
+        cookies: serviceData.cookies
+      };
+    }
+  }
+  
+  // Send results to extension
+  chrome.runtime.sendMessage({
+    action: 'pageAnalyzed',
+    detectedServices: detectedServices,
+    pageUrl: window.location.href
+  });
+  
+  return detectedServices;
+}
+
+// Run analysis
+analyzePageContent();

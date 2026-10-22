@@ -1,0 +1,698 @@
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import random
+import time
+from dataclasses import dataclass, field
+from typing import List, Tuple
+
+import numpy as np
+from scipy import stats
+
+
+# ---------- Hashing & target ----------
+
+
+def double_sha256(payload: bytes) -> bytes:
+    return hashlib.sha256(hashlib.sha256(payload).digest()).digest()
+
+
+def target_for_difficulty(bits: int) -> int:
+    if not 1 <= bits <= 255:
+        raise ValueError("difficulty bits must be between 1 and 255")
+    return 1 << (256 - bits)
+
+
+# ---------- ECDF utilities ----------
+
+
+def ecdf_from_sample(sample: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Return (x, F_n(x)) for the empirical CDF of sample.
+    F_n(x) = proportion of observations <= x.
+    """
+    x = np.sort(sample)
+    n = x.size
+    y = np.arange(1, n + 1) / n
+    return x, y
+
+
+def ks_statistic_uniform_01(sample: np.ndarray) -> float:
+    """
+    One-sample KS statistic against Uniform(0,1).
+    Returns D = sup_x |F_n(x) - x|.
+    """
+    if sample.size == 0:
+        return 0.0
+    x = np.sort(sample)
+    n = x.size
+    Fn = np.arange(1, n + 1) / n
+    D_plus = np.max(Fn - x)
+    D_minus = np.max(x - np.concatenate(([0.0], Fn[:-1])))
+    return float(max(D_plus, D_minus))
+
+
+# ---------- Mining core ----------
+
+
+@dataclass
+class HashRecord:
+    nonce: int
+    digest: bytes
+    u: float
+    is_hit: bool
+
+
+@dataclass
+class MiningStats:
+    difficulty_bits: int
+    target: int
+    attempts: int = 0
+    hits: int = 0
+    misses: int = 0
+    elapsed_seconds: float = 0.0
+    hash_rate: float = 0.0
+    hit_values: List[float] = field(default_factory=list)
+    miss_values: List[float] = field(default_factory=list)
+    log: List[HashRecord] = field(default_factory=list)
+
+    @property
+    def hit_rate(self) -> float:
+        return self.hits / max(self.attempts, 1)
+
+    @property
+    def miss_rate(self) -> float:
+        return self.misses / max(self.attempts, 1)
+
+
+def format_hash_record(nonce: int, digest: bytes, u: float, target: int, label: str = "") -> str:
+    """
+    Return a one-line summary of a hash result:
+      nonce, short hash hex, u value, and whether it's a hit.
+    """
+    value = int.from_bytes(digest, "big")
+    is_hit = value < target
+    short_hex = digest.hex()[:16]  # first 8 bytes as hex
+    hit_mark = "HIT" if is_hit else "miss"
+    if label:
+        hit_mark = f"{label}:{hit_mark}"
+    return f"nonce={nonce:8d}  hash={short_hex}...  u={u:.6f}  [{hit_mark}]"
+
+
+def mine_with_ecdf_tracking(
+    header: bytes,
+    difficulty_bits: int,
+    max_attempts: int,
+    log_limit: int = 40,
+) -> MiningStats:
+    """
+    Mine by scanning nonces 0..max_attempts-1.
+    Track hit/miss and the normalized hash value in [0,1).
+    Also keep a short log of hash records for display.
+    """
+    target = target_for_difficulty(difficulty_bits)
+    stats = MiningStats(
+        difficulty_bits=difficulty_bits,
+        target=target,
+    )
+
+    start = time.perf_counter()
+    first_hit_logged = False
+
+    for nonce in range(max_attempts):
+        candidate = header + nonce.to_bytes(8, "little")
+        digest = double_sha256(candidate)
+        value = int.from_bytes(digest, "big")
+
+        # Normalize to [0,1) as if drawing from Uniform(0,1)
+        u = value / (2**256)
+        is_hit = value < target
+
+        stats.attempts += 1
+
+        if is_hit:
+            stats.hits += 1
+            stats.hit_values.append(u)
+        else:
+            stats.misses += 1
+            stats.miss_values.append(u)
+
+        # Log some records for visibility
+        if len(stats.log) < log_limit or (is_hit and not first_hit_logged):
+            stats.log.append(HashRecord(nonce, digest, u, is_hit))
+            if is_hit:
+                first_hit_logged = True
+
+    stats.elapsed_seconds = time.perf_counter() - start
+    stats.hash_rate = stats.attempts / max(stats.elapsed_seconds, 1e-12)
+
+    return stats
+
+
+def ecdf_proof_score(hit_values: np.ndarray, miss_values: np.ndarray) -> dict:
+    """
+    Compute an ECDF-based 'proof score' for the miner.
+
+    Ideas:
+      - Under a fair hash function, normalized values should be ~ Uniform(0,1).
+      - We compute KS statistic for hits and misses separately.
+      - We also compare ECDF(hit) vs ECDF(miss) with a two-sample KS.
+      - Small D and large p-value => consistent with uniform / no bias.
+      - Large D or small p-value => deviation from ideal behavior.
+
+    Returns a dict with:
+      ks_hits, p_hits, ks_misses, p_misses, ks_2samp, p_2samp
+    """
+    result = {}
+
+    if hit_values.size > 0:
+        ks_hits, p_hits = stats.kstest(hit_values, "uniform")
+        result["ks_hits"] = float(ks_hits)
+        result["p_hits"] = float(p_hits)
+    else:
+        result["ks_hits"] = float("nan")
+        result["p_hits"] = float("nan")
+
+    if miss_values.size > 0:
+        ks_misses, p_misses = stats.kstest(miss_values, "uniform")
+        result["ks_misses"] = float(ks_misses)
+        result["p_misses"] = float(p_misses)
+    else:
+        result["ks_misses"] = float("nan")
+        result["p_misses"] = float("nan")
+
+    if hit_values.size > 0 and miss_values.size > 0:
+        ks_2, p_2 = stats.ks_2samp(hit_values, miss_values)
+        result["ks_2samp"] = float(ks_2)
+        result["p_2samp"] = float(p_2)
+    else:
+        result["ks_2samp"] = float("nan")
+        result["p_2samp"] = float("nan")
+
+    return result
+
+
+# ---------- ECDF vs PLAIN miner comparison ----------
+
+
+@dataclass
+class MinerComparison:
+    ecdf_stats: MiningStats
+    plain_stats: MiningStats
+    ecdf_proof: dict
+    plain_proof: dict
+    enhancement_hit_rate: float
+    enhancement_miss_rate: float
+    cycles_saved: int
+
+def check_difficulty(digest: bytes, difficulty_bits: int) -> bool:
+    """Return True only when the actual SHA-256 digest satisfies the PoW target."""
+    target = target_for_difficulty(difficulty_bits)
+    return int.from_bytes(digest, "big") < target
+
+
+def solve_difficulty(
+    header: bytes,
+    difficulty_bits: int,
+    start_nonce: int = 0,
+    max_attempts: int = 200000,
+) -> Tuple[bool, int, bytes, float]:
+    """
+    Solve the actual PoW condition by testing nonces.
+
+    The ECDF is deliberately NOT used to change the consensus target.
+    This keeps the solver/checker mathematically valid: every reported
+    solution is independently checked against the same target.
+    """
+    target = target_for_difficulty(difficulty_bits)
+    start = time.perf_counter()
+
+    for offset in range(max_attempts):
+        nonce = start_nonce + offset
+        candidate = header + nonce.to_bytes(8, "little", signed=False)
+        digest = double_sha256(candidate)
+
+        if check_difficulty(digest, difficulty_bits):
+            elapsed = time.perf_counter() - start
+            return True, nonce, digest, elapsed
+
+    elapsed = time.perf_counter() - start
+    return False, -1, b"", elapsed
+
+
+def difficulty_checker(
+    header: bytes,
+    nonce: int,
+    digest: bytes,
+    difficulty_bits: int,
+) -> dict:
+    """
+    Independently verify a claimed solution.
+
+    Returns both the target comparison and the normalized hash value so the
+    ECDF can be used as a statistical diagnostic without becoming a solver.
+    """
+    if not 1 <= difficulty_bits <= 255:
+        raise ValueError("difficulty bits must be between 1 and 255")
+    if nonce < 0 or nonce >= 2**64:
+        raise ValueError("nonce must fit in 64 bits")
+
+    expected_digest = double_sha256(header + nonce.to_bytes(8, "little"))
+    digest_matches = digest == expected_digest
+    value = int.from_bytes(digest, "big")
+    target = target_for_difficulty(difficulty_bits)
+    meets_target = value < target
+
+    return {
+        "digest_matches": digest_matches,
+        "meets_target": meets_target,
+        "valid": digest_matches and meets_target,
+        "value": value,
+        "target": target,
+        "u": value / 2**256,
+        "difficulty_bits": difficulty_bits,
+    }
+
+
+def compare_ecdf_vs_plain(
+    header: bytes,
+    difficulty_bits: int,
+    window_size: int,
+    target_hit_prob: float = 0.9,
+    drift_factor: float = 2.0,
+    rng_seed: int = 1234,
+    max_samples: int = 200000,
+) -> MinerComparison:
+    """
+    Compare an ECDF *diagnostic* with the real/plain PoW miner.
+
+    Important correction:
+      The ECDF must never promote an arbitrary hash to a PoW hit by replacing
+      the consensus target with an empirical quantile. A hash is a hit only
+      when value < target_for_difficulty(bits).
+
+    We therefore run both labels over the SAME deterministic nonce stream.
+    The ECDF side records the empirical distribution, while its hit/miss
+    classification uses the exact PoW target. The quantile/drift values are
+    retained only as diagnostics.
+    """
+    del rng_seed, target_hit_prob, drift_factor  # retained for CLI/API compatibility
+
+    if window_size < 10:
+        raise ValueError("window_size must be at least 10")
+    if max_samples < 1:
+        raise ValueError("max_samples must be positive")
+
+    target = target_for_difficulty(difficulty_bits)
+
+    ecdf_window: List[float] = []
+    ecdf_hits = 0
+    ecdf_misses = 0
+    plain_hits = 0
+    plain_misses = 0
+
+    ecdf_hit_values: List[float] = []
+    ecdf_miss_values: List[float] = []
+    plain_hit_values: List[float] = []
+    plain_miss_values: List[float] = []
+
+    ecdf_log: List[HashRecord] = []
+    plain_log: List[HashRecord] = []
+    ecdf_first_hit_logged = False
+    plain_first_hit_logged = False
+
+    ecdf_attempts = 0
+    plain_attempts = 0
+    ecdf_start = time.perf_counter()
+    plain_start = ecdf_start
+
+    # Same nonce/hash stream for both views.
+    for nonce in range(max_samples):
+        digest = double_sha256(header + nonce.to_bytes(8, "little"))
+        value = int.from_bytes(digest, "big")
+        u = value / 2**256
+        is_hit = value < target
+
+        # Plain miner: exact consensus rule.
+        plain_attempts += 1
+        if is_hit:
+            plain_hits += 1
+            plain_hit_values.append(u)
+        else:
+            plain_misses += 1
+            plain_miss_values.append(u)
+
+        if len(plain_log) < 20 or (is_hit and not plain_first_hit_logged):
+            plain_log.append(HashRecord(nonce, digest, u, is_hit))
+            if is_hit:
+                plain_first_hit_logged = True
+
+        # ECDF diagnostic view: distribution window only.
+        ecdf_attempts += 1
+        ecdf_window.append(u)
+        if len(ecdf_window) > window_size:
+            ecdf_window.pop(0)
+
+        # Do NOT use the ECDF quantile as a replacement target.
+        is_hit_ecdf = is_hit
+        if is_hit_ecdf:
+            ecdf_hits += 1
+            ecdf_hit_values.append(u)
+        else:
+            ecdf_misses += 1
+            ecdf_miss_values.append(u)
+
+        if len(ecdf_log) < 20 or (is_hit_ecdf and not ecdf_first_hit_logged):
+            ecdf_log.append(HashRecord(nonce, digest, u, is_hit_ecdf))
+            if is_hit_ecdf:
+                ecdf_first_hit_logged = True
+
+    elapsed = time.perf_counter() - ecdf_start
+
+    ecdf_stats = MiningStats(
+        difficulty_bits=difficulty_bits,
+        target=target,
+        attempts=ecdf_attempts,
+        hits=ecdf_hits,
+        misses=ecdf_misses,
+        elapsed_seconds=elapsed,
+        hash_rate=ecdf_attempts / max(elapsed, 1e-12),
+        hit_values=ecdf_hit_values,
+        miss_values=ecdf_miss_values,
+        log=ecdf_log,
+    )
+
+    plain_stats = MiningStats(
+        difficulty_bits=difficulty_bits,
+        target=target,
+        attempts=plain_attempts,
+        hits=plain_hits,
+        misses=plain_misses,
+        elapsed_seconds=elapsed,
+        hash_rate=plain_attempts / max(elapsed, 1e-12),
+        hit_values=plain_hit_values,
+        miss_values=plain_miss_values,
+        log=plain_log,
+    )
+
+    ecdf_proof = ecdf_proof_score(
+        np.asarray(ecdf_hit_values, dtype=float),
+        np.asarray(ecdf_miss_values, dtype=float),
+    )
+    plain_proof = ecdf_proof_score(
+        np.asarray(plain_hit_values, dtype=float),
+        np.asarray(plain_miss_values, dtype=float),
+    )
+
+    # Since both views use the same exact target and nonce stream, these must
+    # agree exactly. This is the checker invariant.
+    if (
+        ecdf_stats.hits != plain_stats.hits
+        or ecdf_stats.misses != plain_stats.misses
+        or ecdf_stats.attempts != plain_stats.attempts
+    ):
+        raise RuntimeError("ECDF/plain checker invariant violated")
+
+    return MinerComparison(
+        ecdf_stats=ecdf_stats,
+        plain_stats=plain_stats,
+        ecdf_proof=ecdf_proof,
+        plain_proof=plain_proof,
+        enhancement_hit_rate=1.0 if plain_stats.hit_rate > 0 else float("nan"),
+        enhancement_miss_rate=1.0 if plain_stats.miss_rate > 0 else float("nan"),
+        cycles_saved=0,
+    )
+
+
+# ---------- CLI & reporting ----------
+
+
+def print_mining_stats(label: str, s: MiningStats) -> None:
+    print(f"\n{label}")
+    print(f"  Difficulty bits:   {s.difficulty_bits}")
+    print(f"  Target:            {s.target:064x}")
+    print(f"  Attempts:          {s.attempts:,}")
+    print(f"  Hits:              {s.hits:,}")
+    print(f"  Misses:            {s.misses:,}")
+    print(f"  Hit rate:          {s.hit_rate:.6f}")
+    print(f"  Miss rate:         {s.miss_rate:.6f}")
+    print(f"  Elapsed:           {s.elapsed_seconds:.4f} s")
+    print(f"  Hash rate:         {s.hash_rate:,.0f} H/s")
+
+    # Print actual hashes from the log
+    if not s.log:
+        print("  (No hash records logged.)")
+        return
+
+    print(f"\n  Sample hashes (first {min(20, len(s.log))} records):")
+    for i, rec in enumerate(s.log[:20]):
+        short_hex = rec.digest.hex()[:16]
+        hit_mark = "HIT" if rec.is_hit else "miss"
+        print(
+            f"    {i:2d}: nonce={rec.nonce:8d}  hash={short_hex}...  "
+            f"u={rec.u:.6f}  [{hit_mark}]"
+        )
+
+    hits = [r for r in s.log if r.is_hit]
+    if hits:
+        first_hit = hits[0]
+        print("\n  First hit:")
+        print(
+            f"    nonce={first_hit.nonce:8d}  hash={first_hit.digest.hex()}  "
+            f"u={first_hit.u:.6f}  [FIRST HIT]"
+        )
+        print(f"    Target: {s.target:064x}")
+
+
+def print_ecdf_proof(label: str, proof: dict) -> None:
+    print(f"\n{label} ECDF proof scores")
+    print(f"  KS hits:           {proof.get('ks_hits', None)}")
+    print(f"  p-value hits:      {proof.get('p_hits', None)}")
+    print(f"  KS misses:         {proof.get('ks_misses', None)}")
+    print(f"  p-value misses:    {proof.get('p_misses', None)}")
+    print(f"  KS 2-sample:       {proof.get('ks_2samp', None)}")
+    print(f"  p-value 2-sample:  {proof.get('p_2samp', None)}")
+
+
+def run_basic_mining_experiment(
+    header: bytes,
+    difficulty_bits: int,
+    max_attempts: int,
+) -> None:
+    print("=== ECDF-based Proof-of-Work Mining Experiment ===")
+    print(f"Header length:       {len(header)} bytes")
+    print(f"Difficulty bits:     {difficulty_bits}")
+    print(f"Max attempts:        {max_attempts:,}")
+
+    stats = mine_with_ecdf_tracking(header, difficulty_bits, max_attempts, log_limit=40)
+    print_mining_stats("Mining statistics", stats)
+
+    # Show first few hash records
+    print("\nFirst hash records (sample):")
+    for i, rec in enumerate(stats.log[:20]):
+        line = format_hash_record(rec.nonce, rec.digest, rec.u, stats.target)
+        print(f"  {i:2d}: {line}")
+
+    # Highlight first hit if present
+    hits = [r for r in stats.log if r.is_hit]
+    if hits:
+        first_hit = hits[0]
+        print("\nFirst hit:")
+        print(f"  {format_hash_record(first_hit.nonce, first_hit.digest, first_hit.u, stats.target, 'FIRST')}")
+        print(f"  Full hash: {first_hit.digest.hex()}")
+        print(f"  Target:    {stats.target:064x}")
+
+    hit_arr = np.array(stats.hit_values, dtype=float)
+    miss_arr = np.array(stats.miss_values, dtype=float)
+
+    proof = ecdf_proof_score(hit_arr, miss_arr)
+    print_ecdf_proof("Global", proof)
+
+    # Simple decision rule: if KS is too large, flag as suspicious
+    ks_max = max(
+        proof["ks_hits"] if not np.isnan(proof["ks_hits"]) else 0.0,
+        proof["ks_misses"] if not np.isnan(proof["ks_misses"]) else 0.0,
+    )
+    print(f"\nMax KS statistic:    {ks_max:.4f}")
+    if ks_max > 0.2:
+        print("Interpretation:    Strong deviation from uniform (suspicious).")
+    elif ks_max > 0.1:
+        print("Interpretation:    Moderate deviation from uniform.")
+    else:
+        print("Interpretation:    Consistent with uniform hash behavior.")
+
+
+def run_comparison_experiment(
+    header: bytes,
+    difficulty_bits: int,
+    window_size: int,
+    target_p: float,
+    drift_factor: float,
+    seed: int,
+) -> None:
+    print("=== ECDF vs PLAIN Miner Comparison ===")
+    print(f"Difficulty bits:     {difficulty_bits}")
+    print(f"ECDF window size:    {window_size}")
+    print(f"Target hit prob:     {target_p:.2f}")
+    print(f"Drift factor:        {drift_factor:.2f}")
+    print(f"RNG seed:            {seed}")
+
+    comp = compare_ecdf_vs_plain(
+        header,
+        difficulty_bits,
+        window_size,
+        target_hit_prob=target_p,
+        drift_factor=drift_factor,
+        rng_seed=seed,
+    )
+
+    print_mining_stats("ECDF proof miner", comp.ecdf_stats)
+    print_mining_stats("Plain miner", comp.plain_stats)
+
+    print_ecdf_proof("ECDF", comp.ecdf_proof)
+    print_ecdf_proof("Plain", comp.plain_proof)
+
+    print("\nChecker invariants")
+    print(f"  Hit-rate ratio (ECDF/plain): {comp.enhancement_hit_rate:.3f}")
+    print(f"  Miss-rate ratio (ECDF/plain): {comp.enhancement_miss_rate:.3f}")
+    print(f"  Cycles saved by ECDF:          {comp.cycles_saved:,}")
+    print("  Consensus target changed by ECDF: NO")
+
+    ks_ecdf = max(
+        comp.ecdf_proof["ks_hits"] if not np.isnan(comp.ecdf_proof["ks_hits"]) else 0.0,
+        comp.ecdf_proof["ks_misses"] if not np.isnan(comp.ecdf_proof["ks_misses"]) else 0.0,
+    )
+    ks_plain = max(
+        comp.plain_proof["ks_hits"] if not np.isnan(comp.plain_proof["ks_hits"]) else 0.0,
+        comp.plain_proof["ks_misses"] if not np.isnan(comp.plain_proof["ks_misses"]) else 0.0,
+    )
+
+    print("\nProof state")
+    print(f"  ECDF KS max:       {ks_ecdf:.4f}")
+    print(f"  Plain KS max:      {ks_plain:.4f}")
+    if ecdf_stats := comp.ecdf_stats:
+        same_counts = (
+            ecdf_stats.attempts == comp.plain_stats.attempts
+            and ecdf_stats.hits == comp.plain_stats.hits
+            and ecdf_stats.misses == comp.plain_stats.misses
+        )
+        print(f"  ECDF/Plain target agreement: {'✓' if same_counts else '✗'}")
+    if ks_ecdf < 0.15:
+        print("  ECDF distribution:          ✓ within heuristic KS bound")
+    else:
+        print("  ECDF distribution:          ✗ deviation detected")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="ECDF-based proof-of-work experiment"
+    )
+    subparsers = parser.add_subparsers(dest="mode", required=True)
+
+    # Basic mining mode
+    mine_parser = subparsers.add_parser("mine", help="Basic ECDF-tracked mining")
+    mine_parser.add_argument(
+        "--bits",
+        type=int,
+        default=18,
+        help="difficulty bits (expected work ~ 2**bits)",
+    )
+    mine_parser.add_argument(
+        "--attempts",
+        type=int,
+        default=2000000,
+        help="max nonce attempts per trial",
+    )
+
+    # Comparison mode (ECDF vs plain)
+    comp_parser = subparsers.add_parser(
+        "compare", help="ECDF vs plain miner comparison"
+    )
+    comp_parser.add_argument(
+        "--bits",
+        type=int,
+        default=10,
+        help="difficulty bits for plain miner window",
+    )
+    comp_parser.add_argument(
+        "--window",
+        type=int,
+        default=512,
+        help="ECDF rolling window size",
+    )
+    comp_parser.add_argument(
+        "--target-p",
+        type=float,
+        default=0.9,
+        help="target hit probability for ECDF miner",
+    )
+    comp_parser.add_argument(
+        "--drift",
+        type=float,
+        default=2.0,
+        help="drift factor applied to ECDF threshold",
+    )
+    comp_parser.add_argument(
+        "--seed",
+        type=int,
+        default=1234,
+        help="RNG seed for nonce stream",
+    )
+
+    # Exact difficulty solver/checker mode
+    solve_parser = subparsers.add_parser(
+        "solve", help="Solve and independently check the exact PoW difficulty target"
+    )
+    solve_parser.add_argument("--bits", type=int, default=18)
+    solve_parser.add_argument("--start-nonce", type=int, default=0)
+    solve_parser.add_argument("--attempts", type=int, default=2000000)
+
+    args = parser.parse_args()
+
+    # Fixed header for reproducibility
+    header = (
+        b"previous_hash=00000000000000000000000000000000000000000000000000000000|"
+        b"merkle_root=ecdf-pow-experiment|"
+        b"timestamp=2026-09-12T14:27:00+10:00|"
+        b"transactions=alice->bob:1.25"
+    )
+
+    if args.mode == "mine":
+        run_basic_mining_experiment(header, args.bits, args.attempts)
+    elif args.mode == "compare":
+        run_comparison_experiment(
+            header,
+            args.bits,
+            args.window,
+            args.target_p,
+            args.drift,
+            args.seed,
+        )
+    elif args.mode == "solve":
+        ok, nonce, digest, elapsed = solve_difficulty(
+            header,
+            args.bits,
+            args.start_nonce,
+            args.attempts,
+        )
+        print("=== Exact Difficulty Solver / Checker ===")
+        print(f"Difficulty bits: {args.bits}")
+        print(f"Target:          {target_for_difficulty(args.bits):064x}")
+        print(f"Attempts:        {args.attempts:,}")
+        print(f"Elapsed:         {elapsed:.6f} s")
+        if not ok:
+            print("Result:          NO SOLUTION IN RANGE")
+        else:
+            result = difficulty_checker(header, nonce, digest, args.bits)
+            print(f"Nonce:           {nonce}")
+            print(f"Hash:            {digest.hex()}")
+            print(f"u:               {result['u']:.12f}")
+            print(f"Digest matches:  {result['digest_matches']}")
+            print(f"Meets target:    {result['meets_target']}")
+            print(f"CHECK:           {'VALID' if result['valid'] else 'INVALID'}")
+
+
+if __name__ == "__main__":
+    main()

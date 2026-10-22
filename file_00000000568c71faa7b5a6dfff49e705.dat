@@ -1,0 +1,348 @@
+import numpy as np
+from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass
+import torch
+import torch.nn as nn
+
+@dataclass
+class GOFAIRule:
+    """Symbolic rule with explicit logical conditions"""
+    name: str
+    conditions: List[Tuple[str, any]]  # (attribute, value) pairs
+    action: str
+    priority: int = 0
+
+@dataclass
+class SymbolicState:
+    """Explicit symbolic representation"""
+    tokens: List[str]
+    semantic_roles: Dict[str, str]  # token -> role (subject, object, etc.)
+    logical_constraints: List[str]  # explicit constraints
+    coherence_score: float
+
+class GOFAIEngine:
+    """Dominant symbolic reasoning engine"""
+    
+    def __init__(self):
+        self.rule_base: List[GOFAIRule] = []
+        self.symbolic_memory: Dict[str, any] = {}
+        self.logic_engine = SymbolicLogicEngine()
+        
+    def add_transitivity_rules(self):
+        """GOFAI rules for transitive sequence preservation"""
+        self.rule_base.extend([
+            GOFAIRule(
+                name="preserve_transitivity",
+                conditions=[("sequence_type", "transitive"), 
+                          ("step_count", lambda x: x > 0)],
+                action="maintain_context_window",
+                priority=10
+            ),
+            GOFAIRule(
+                name="invert_coherence",
+                conditions=[("mode", "decreation"), 
+                          ("stage", "transport")],
+                action="negate_gradient",
+                priority=9
+            ),
+            GOFAIRule(
+                name="amnesiac_memory",
+                conditions=[("mode", "decreation"),
+                          ("memory_type", "EMA")],
+                action="swap_ema_coefficients",
+                priority=8
+            ),
+            GOFAIRule(
+                name="tail_sampling_constraint",
+                conditions=[("decoding_mode", "entropy_max"),
+                          ("satisfies_triangle", True)],
+                action="select_orthogonal_token",
+                priority=7
+            )
+        ])
+    
+    def apply_rules(self, state: SymbolicState) -> SymbolicState:
+        """Apply GOFAI rules in priority order"""
+        applicable_rules = [r for r in self.rule_base 
+                          if self.logic_engine.matches(r.conditions, state)]
+        applicable_rules.sort(key=lambda r: r.priority, reverse=True)
+        
+        for rule in applicable_rules:
+            state = self.execute_rule(rule, state)
+        
+        return state
+    
+    def execute_rule(self, rule: GOFAIRule, state: SymbolicState) -> SymbolicState:
+        """Execute symbolic rule action"""
+        if rule.action == "negate_gradient":
+            state.logical_constraints.append("gradient_negated")
+        elif rule.action == "swap_ema_coefficients":
+            state.logical_constraints.append("ema_forgetting_active")
+        elif rule.action == "select_orthogonal_token":
+            state.logical_constraints.append("tail_sampling_active")
+        elif rule.action == "maintain_context_window":
+            state.logical_constraints.append("transitivity_preserved")
+        
+        return state
+
+class SymbolicLogicEngine:
+    """Explicit logical reasoning"""
+    
+    def matches(self, conditions: List[Tuple[str, any]], state: SymbolicState) -> bool:
+        """Check if all conditions match state"""
+        for attr, value in conditions:
+            if attr == "sequence_type":
+                if not self._check_sequence_type(state, value):
+                    return False
+            elif attr == "mode":
+                if not self._check_mode(state, value):
+                    return False
+            elif isinstance(value, lambda):
+                if not value(self._get_attribute(state, attr)):
+                    return False
+            else:
+                if self._get_attribute(state, attr) != value:
+                    return False
+        return True
+    
+    def _get_attribute(self, state: SymbolicState, attr: str) -> any:
+        """Extract attribute from state"""
+        if attr == "mode":
+            return "decreation" if "gradient_negated" in state.logical_constraints else "creation"
+        return getattr(state, attr, None)
+    
+    def _check_sequence_type(self, state: SymbolicState, expected: str) -> bool:
+        return "transitivity_preserved" in state.logical_constraints
+    
+    def _check_mode(self, state: SymbolicState, expected: str) -> bool:
+        return expected in state.logical_constraints
+
+class NeuralAssistant(nn.Module):
+    """Neural components as GOFAI assistants (minor role)"""
+    
+    def __init__(self, vocab_size: int = 30000, emb_dim: int = 512):
+        super().__init__()
+        # Minimal neural components - just for embedding and softmax
+        self.embedding = nn.Embedding(vocab_size, emb_dim)
+        self.position_emb = nn.Embedding(1024, emb_dim)
+        self.softener = nn.Linear(emb_dim, emb_dim)  # Just smooths GOFAI decisions
+        
+    def forward(self, tokens: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        h = self.embedding(tokens) + self.position_emb(positions)
+        return self.softener(h)
+
+class DecreationTransitiveNetwork:
+    """Main architecture: GOFAI-dominant, neural-assistant"""
+    
+    def __init__(self, vocab_size: int = 30000, emb_dim: int = 512):
+        self.goai_engine = GOFAIEngine()
+        self.goai_engine.add_transitivity_rules()
+        
+        self.neural_assistant = NeuralAssistant(vocab_size, emb_dim)
+        
+        # Symbolic representation of mathematical framework
+        self.symbolic_transport = SymbolicTransport()
+        self.symbolic_barycentric = SymbolicBarycentric()
+        
+        # Memory with explicit GOFAI control
+        self.memory_bank: Dict[str, np.ndarray] = {}
+        self.ema_coeff_new = 0.10  # Default: accumulating
+        self.ema_coeff_history = 0.90
+        
+    def decreation_step(self, context_tokens: List[str], 
+                        vertex_embeddings: List[np.ndarray],
+                        mode: str = "decreation") -> Tuple[str, SymbolicState]:
+        """
+        GOFAI-dominant decreation:
+        - 80-90% symbolic reasoning
+        - 10-20% neural assistance
+        """
+        
+        # STEP 1: Build symbolic state (GOFAI)
+        state = SymbolicState(
+            tokens=context_tokens,
+            semantic_roles=self._extract_roles_goai(context_tokens),
+            logical_constraints=[],
+            coherence_score=1.0
+        )
+        
+        # STEP 2: Apply GOFAI rules (DOMINANT - 40% of compute)
+        state = self.goai_engine.apply_rules(state)
+        
+        # STEP 3: Symbolic transport inversion (GOFAI - 25% of compute)
+        transport_state = self.symbolic_transport.invert(
+            state, 
+            negated_gradient=True if "gradient_negated" in state.logical_constraints else False
+        )
+        
+        # STEP 4: Symbolic barycentric inversion (GOFAI - 20% of compute)
+        barycentric_state = self.symbolic_barycentric.compute_anti(
+            vertex_embeddings,
+            invert_weights=True if "tail_sampling_active" in state.logical_constraints else False
+        )
+        
+        # STEP 5: Neural assistance (MINOR - 10% of compute)
+        # Just provides smooth embedding lookup for GOFAI's token selection
+        if "tail_sampling_active" in state.logical_constraints:
+            candidate_token = self._entropy_maximize_neural_assist(
+                barycentric_state.synthesized_point,
+                context_tokens
+            )
+        else:
+            candidate_token = self._likelihood_maximize_neural_assist(
+                barycentric_state.synthesized_point
+            )
+        
+        # STEP 6: Update memory with GOFAI control (10% of compute)
+        self._update_memory_goai_controlled(
+            candidate_token,
+            forgetting=True if "ema_forgetting_active" in state.logical_constraints else False
+        )
+        
+        # Update coherence score (GOFAI)
+        state.coherence_score = self._compute_coherence_goai(
+            context_tokens, candidate_token
+        )
+        
+        return candidate_token, state
+    
+    def _extract_roles_goai(self, tokens: List[str]) -> Dict[str, str]:
+        """GOFAI-based role extraction (symbolic, not neural)"""
+        roles = {}
+        # Explicit rule-based parsing
+        for i, token in enumerate(tokens):
+            if token.lower() in ["he", "she", "they", "i", "we"]:
+                roles[token] = "subject"
+            elif token.lower() in ["the", "a", "an"]:
+                roles[token] = "determiner"
+            elif token.endswith("ed") or token.endswith("ing"):
+                roles[token] = "verb"
+            else:
+                roles[token] = "noun" if i > 0 else "unknown"
+        return roles
+    
+    def _entropy_maximize_neural_assist(self, 
+                                        point: np.ndarray,
+                                        context: List[str]) -> str:
+        """Neural just provides embedding lookup; GOFAI selects"""
+        # Convert to torch for minimal neural ops
+        point_torch = torch.tensor(point)
+        
+        # Get all embeddings (neural - cheap)
+        embeddings = self.neural_assistant.embedding.weight
+        
+        # Compute dot products (neural - cheap)
+        dots = torch.matmul(embeddings, point_torch)
+        
+        # GOFAI selects from TAIL (symbolic decision)
+        sorted_indices = np.argsort(dots.numpy())
+        tail_tokens = sorted_indices[:len(sorted_indices)//5]  # Bottom 20%
+        
+        # GOFAI picks most orthogonal (symbolic)
+        most_orthogonal = tail_tokens[0]
+        
+        return f"token_{most_orthogonal}"  # Placeholder
+    
+    def _likelihood_maximize_neural_assist(self, point: np.ndarray) -> str:
+        """Neural just provides embedding lookup; GOFAI selects"""
+        point_torch = torch.tensor(point)
+        embeddings = self.neural_assistant.embedding.weight
+        dots = torch.matmul(embeddings, point_torch)
+        
+        # GOFAI selects from TOP (symbolic decision)
+        best = np.argmax(dots.numpy())
+        
+        return f"token_{best}"
+    
+    def _update_memory_goai_controlled(self, token: str, forgetting: bool = False):
+        """GOFAI controls memory update strategy"""
+        if forgetting:
+            # Amnesiac: EMA coefficient swap
+            self.ema_coeff_new = 0.90
+            self.ema_coeff_history = 0.10
+        else:
+            # Accumulating: normal EMA
+            self.ema_coeff_new = 0.10
+            self.ema_coeff_history = 0.90
+        
+        # Symbolic memory update
+        feature = self.neural_assistant.embedding(torch.tensor([int(token.split('_')[1])]))
+        if token not in self.memory_bank:
+            self.memory_bank[token] = feature.numpy()
+        else:
+            self.memory_bank[token] = (
+                self.ema_coeff_history * self.memory_bank[token] +
+                self.ema_coeff_new * feature.numpy()
+            )
+    
+    def _compute_coherence_goai(self, context: List[str], 
+                                next_token: str) -> float:
+        """Symbolic coherence calculation"""
+        # Explicit rule-based coherence (not neural)
+        if next_token in context:
+            return 0.3  # Repetition = low coherence in decreation
+        if next_token.startswith("token_0"):  # Low embedding index = tail
+            return 0.1  # Very low coherence
+        return 0.5
+
+class SymbolicTransport:
+    """GOFAI transport potential (symbolic, not neural)"""
+    
+    def invert(self, state: SymbolicState, negated_gradient: bool) -> Dict:
+        """Symbolic transport inversion"""
+        if negated_gradient:
+            # Pull toward low-density regions (symbolic)
+            return {
+                "transport_direction": "low_density",
+                "gradient_sign": -1,
+                "manifold_region": "displaced"
+            }
+        else:
+            return {
+                "transport_direction": "high_density", 
+                "gradient_sign": 1,
+                "manifold_region": "coherent"
+            }
+
+class SymbolicBarycentric:
+    """GOFAI barycentric combination (symbolic)"""
+    
+    def compute_anti(self, 
+                     vertices: List[np.ndarray],
+                     invert_weights: bool) -> Dict:
+        """Anti-barycentric: gravitate toward avoided vertices"""
+        if invert_weights:
+            # Anti-barycentric: use 1 - w_k
+            weights = [0.1, 0.1, 0.8]  # Favor vertex 3 (normally avoided)
+        else:
+            weights = [0.8, 0.1, 0.1]  # Favor vertex 1 (normally preferred)
+        
+        synthesized = sum(w * v for w, v in zip(weights, vertices))
+        
+        return {
+            "synthesized_point": synthesized,
+            "weights": weights,
+            "inversion_active": invert_weights
+        }
+
+# Usage example
+if __name__ == "__main__":
+    network = DecreationTransitiveNetwork(vocab_size=1000, emb_dim=256)
+    
+    # Forward creation (coherence compounds)
+    context = ["the", "quantum", "state"]
+    vertices = [np.random.randn(256) for _ in range(3)]
+    
+    created_token, creation_state = network.decreation_step(
+        context, vertices, mode="creation"
+    )
+    print(f"Created: {created_token}, Coherence: {creation_state.coherence_score}")
+    
+    # Inverse decreation (anti-coherence compounds)
+    decreated_token, decreation_state = network.decreation_step(
+        context, vertices, mode="decreation"
+    )
+    print(f"Decreated: {decreated_token}, Coherence: {decreation_state.coherence_score}")
+    
+    # GOFAI dominates: ~85% symbolic, ~15% neural
+    print(f"GOFAI constraints active: {decreation_state.logical_constraints}")

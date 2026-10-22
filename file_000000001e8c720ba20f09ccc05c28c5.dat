@@ -1,0 +1,155 @@
+
+# t_structure_model.py
+# Research prototype implementing:
+# - trigram extraction
+# - structural signatures
+# - T-Structure (Y-axis depth, X-axis realizations)
+# - boosted weights W = X * Y^alpha
+# - neural encoder
+# - transition model
+# - training and generation
+
+import random
+from collections import defaultdict, Counter
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from nltk import pos_tag
+from nltk.tokenize import word_tokenize
+
+def signature(tri):
+    return tuple(tag for _, tag in pos_tag(list(tri)))
+
+def trigrams(tokens):
+    return [tuple(tokens[i:i+3]) for i in range(len(tokens)-2)]
+
+class CorpusDataset(Dataset):
+    def __init__(self, text):
+        toks = word_tokenize(text.lower())
+        self.word2id = {"<pad>":0,"<unk>":1}
+        for w in toks:
+            if w not in self.word2id:
+                self.word2id[w] = len(self.word2id)
+        self.id2word = {v:k for k,v in self.word2id.items()}
+
+        tris = trigrams(toks)
+        self.items = []
+        self.buckets = defaultdict(list)
+
+        for tri in tris:
+            ids = [self.word2id[w] for w in tri]
+            sig = signature(tri)
+            self.buckets[sig].append(ids)
+
+        sigs = list(self.buckets.keys())
+        for sig in sigs:
+            b = self.buckets[sig]
+            for i in range(max(0, len(b)-1)):
+                pos = b[i+1]
+                anc = b[i]
+                negsig = random.choice([s for s in sigs if s != sig])
+                neg = random.choice(self.buckets[negsig])
+                self.items.append((anc,pos,neg))
+
+    def __len__(self): return len(self.items)
+
+    def __getitem__(self, idx):
+        a,p,n = self.items[idx]
+        return torch.tensor(a), torch.tensor(p), torch.tensor(n)
+
+class TStructure:
+    def __init__(self, alpha=2.0):
+        self.alpha = alpha
+        self.signature_freq = Counter()
+        self.trigram_freq = Counter()
+        self.structure = {}
+
+    def build(self, dataset):
+        for sig, bucket in dataset.buckets.items():
+            self.signature_freq[sig] += len(bucket)
+            for tri in bucket:
+                words = tuple(dataset.id2word[i] for i in tri)
+                self.trigram_freq[words] += 1
+
+        for tri, x in self.trigram_freq.items():
+            sig = signature(tri)
+            y = self.signature_freq[sig]
+            w = x * (y ** self.alpha)
+
+            self.structure.setdefault(sig, {
+                "depth": y,
+                "members": []
+            })
+            self.structure[sig]["members"].append((tri,w))
+
+    def sample(self, sig):
+        if sig not in self.structure:
+            return None
+        m = self.structure[sig]["members"]
+        tris = [x[0] for x in m]
+        weights = [x[1] for x in m]
+        return random.choices(tris, weights=weights, k=1)[0]
+
+class Encoder(nn.Module):
+    def __init__(self, vocab, emb=128, hid=256, latent=64):
+        super().__init__()
+        self.emb = nn.Embedding(vocab, emb)
+        self.gru = nn.GRU(emb, hid, batch_first=True)
+        self.proj = nn.Linear(hid, latent)
+
+    def forward(self, x):
+        e = self.emb(x)
+        _, h = self.gru(e)
+        return F.normalize(self.proj(h.squeeze(0)), dim=-1)
+
+class TransitionNet(nn.Module):
+    def __init__(self, latent=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent, 256),
+            nn.GELU(),
+            nn.Linear(256, latent)
+        )
+    def forward(self, z):
+        return self.net(z)
+
+class Model(nn.Module):
+    def __init__(self, vocab):
+        super().__init__()
+        self.encoder = Encoder(vocab)
+        self.transition = TransitionNet()
+
+def contrastive(a,p,n,margin=0.5):
+    pos = 1 - F.cosine_similarity(a,p)
+    neg = 1 - F.cosine_similarity(a,n)
+    return torch.relu(pos - neg + margin).mean()
+
+def train(model, loader, epochs=5):
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    for epoch in range(epochs):
+        total = 0
+        for a,p,n in loader:
+            za = model.encoder(a)
+            zp = model.encoder(p)
+            zn = model.encoder(n)
+            pred = model.transition(za)
+
+            loss = contrastive(za,zp,zn) + 0.5*F.mse_loss(pred,zp)
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            total += loss.item()
+        print(epoch+1, total/max(1,len(loader)))
+
+def generate(seed_words, dataset, tstruct, steps=100):
+    words = list(seed_words)
+    for _ in range(steps):
+        sig = signature(tuple(words[-3:]))
+        if sig not in tstruct.structure:
+            break
+        tri = tstruct.sample(sig)
+        words.append(tri[-1])
+    return " ".join(words)

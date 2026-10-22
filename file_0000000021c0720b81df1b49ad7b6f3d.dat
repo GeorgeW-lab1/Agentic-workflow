@@ -1,0 +1,194 @@
+
+# FULL Monge–Ampère NOCN Refactor (single-file version)
+# End-to-end replacement architecture:
+# Embedding -> Coefficient Encoder -> Temporal Dynamics
+# -> Monge-Ampere Transport -> Memory Fusion -> Decoder
+
+import math
+import random
+from collections import defaultdict
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+
+class Config:
+    text_path = "singlekb.txt"
+    seed = 42
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    seq_len = 4
+    batch_size = 256
+    epochs = 8
+    lr = 2e-3
+
+    d_model = 96
+    d_coef = 32
+    d_obj = 96
+    d_mem = 96
+
+    temp_step = 0.08
+    lambda_transport = 0.1
+    lambda_contrastive = 0.2
+
+
+def tokenize(text):
+    text = text.lower()
+    out = []
+    cur = []
+    for ch in text:
+        if ch.isalnum() or ch == "'":
+            cur.append(ch)
+        else:
+            if cur:
+                out.append("".join(cur))
+                cur = []
+    if cur:
+        out.append("".join(cur))
+    return out
+
+
+def build_vocab(tokens):
+    vocab = ["<pad>", "<unk>", "<bos>", "<eos>"] + sorted(set(tokens))
+    stoi = {t:i for i,t in enumerate(vocab)}
+    itos = {i:t for t,i in stoi.items()}
+    return vocab, stoi, itos
+
+
+class TextWindowDataset(Dataset):
+    def __init__(self, ids, seq_len):
+        self.samples = [ids[i:i+seq_len] for i in range(len(ids)-seq_len)]
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        s = self.samples[idx]
+        return torch.tensor(s[:-1]), torch.tensor(s[-1])
+
+
+class DynamicMemoryGraph:
+    def __init__(self, slots, dim, device):
+        self.node = torch.zeros(slots, dim, device=device)
+        self.token_to_slot = {}
+        self.ptr = 0
+
+    def update(self, token_ids, feats):
+        with torch.no_grad():
+            for tid, feat in zip(token_ids.tolist(), feats):
+                if tid not in self.token_to_slot:
+                    self.token_to_slot[tid] = self.ptr
+                    self.ptr = (self.ptr + 1) % self.node.size(0)
+                s = self.token_to_slot[tid]
+                self.node[s] = 0.95 * self.node[s] + 0.05 * feat
+
+    def read(self, token_ids):
+        out = []
+        for tid in token_ids.tolist():
+            if tid in self.token_to_slot:
+                out.append(self.node[self.token_to_slot[tid]])
+            else:
+                out.append(torch.zeros(self.node.size(1), device=self.node.device))
+        return torch.stack(out)
+
+
+class TransportPotential(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d, d),
+            nn.SiLU(),
+            nn.Linear(d, d),
+            nn.SiLU(),
+            nn.Linear(d, 1)
+        )
+
+    def forward(self, x):
+        x = x.requires_grad_(True)
+        phi = self.net(x).sum()
+        grad = torch.autograd.grad(phi, x, create_graph=True)[0]
+        return grad
+
+
+class MongeAmpereNOCN(nn.Module):
+    def __init__(self, vocab_size, cfg):
+        super().__init__()
+        self.cfg = cfg
+
+        self.word_emb = nn.Embedding(vocab_size, cfg.d_model)
+        self.pos_emb = nn.Embedding(cfg.seq_len - 1, cfg.d_model)
+
+        self.coeff_encoder = nn.Sequential(
+            nn.Linear(cfg.d_model, cfg.d_coef),
+            nn.Tanh(),
+            nn.Linear(cfg.d_coef, cfg.d_coef)
+        )
+
+        self.temporal_ode = nn.Sequential(
+            nn.Linear(cfg.d_model + cfg.d_coef, cfg.d_obj),
+            nn.SiLU(),
+            nn.Linear(cfg.d_obj, cfg.d_obj)
+        )
+
+        self.transport = TransportPotential(cfg.d_obj)
+        self.mem_project = nn.Linear(cfg.d_mem, cfg.d_obj)
+
+        self.decoder = nn.Sequential(
+            nn.Linear(cfg.d_obj * 2, cfg.d_obj),
+            nn.GELU(),
+            nn.Linear(cfg.d_obj, vocab_size)
+        )
+
+        self.contrast_proj = nn.Linear(cfg.d_obj, cfg.d_obj)
+
+    def encode_context(self, x):
+        pos = torch.arange(x.size(1), device=x.device)
+        h = self.word_emb(x) + self.pos_emb(pos)[None]
+        h = h.mean(1)
+        c = self.coeff_encoder(h)
+        return h, c
+
+    def temporal_dynamics(self, h, c):
+        z = torch.cat([h, c], dim=-1)
+        dz = self.temporal_ode(z)
+        return h + self.cfg.temp_step * dz
+
+    def forward(self, x, mem):
+        h, c = self.encode_context(x)
+        obj = self.temporal_dynamics(h, c)
+
+        transported = self.transport(obj)
+        mem = self.mem_project(mem)
+
+        logits = self.decoder(torch.cat([transported, mem], dim=-1))
+
+        return {
+            "logits": logits,
+            "transported": transported
+        }
+
+    def loss_fn(self, out, y):
+        recon = F.cross_entropy(out["logits"], y)
+
+        density = torch.softmax(
+            out["transported"].norm(dim=-1),
+            dim=0
+        )
+        target = torch.ones_like(density) / density.numel()
+
+        ma_loss = F.mse_loss(density, target)
+
+        z = F.normalize(
+            self.contrast_proj(out["transported"]),
+            dim=-1
+        )
+        sim = z @ z.t()
+        eye = torch.eye(sim.size(0), device=sim.device)
+        contrast = ((sim - eye) ** 2).mean()
+
+        return recon + self.cfg.lambda_transport * ma_loss + self.cfg.lambda_contrastive * contrast
+
+
+print("Full Monge–Ampere refactor loaded.")

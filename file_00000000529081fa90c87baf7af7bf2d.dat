@@ -1,0 +1,1562 @@
+#!/usr/bin/env python3
+"""
+Frequency-conditioned optical quantum trigram language model.
+
+Pipeline
+--------
+
+Corpus
+  |
+  +--> word cleaning
+  |
+  +--> trigram/context frequency model
+  |
+  +--> contextual probabilities
+  |
+  +--> temperature smoothing
+  |
+  +--> Bernoulli probabilities
+  |
+  +--> RY angles
+  |
+  +--> frequency-conditioned quantum circuit
+  |
+  +--> optical measurement
+  |
+  +--> contextual candidate selection
+  |
+  +--> generated text
+
+
+Quantum mapping
+---------------
+
+For a probability p:
+
+    p = sin^2(theta / 2)
+
+therefore:
+
+    theta = 2 * asin(sqrt(p))
+
+
+The circuit is generated from the actual corpus frequencies.
+
+Important:
+    The quantum circuit does NOT independently represent every
+    trigram. Instead, its measurement distribution is used as
+    a stochastic selector over the candidate words allowed by
+    the current trigram context.
+
+This avoids constructing enormous vocabularies or matrices.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import random
+import re
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import numpy as np
+
+from quantum_optical_bench import (
+    GeneralQuantumComputer,
+    OpticalBackend,
+    OpticalBench,
+    OpticalCamera,
+    SyntheticCamera,
+    ITOController,
+    parse_q_file,
+    parse_operations,
+)
+
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+
+DEFAULT_SEED = 2026
+
+CONTROL_TOKENS = {
+    "¶",
+    "\x00",
+    "\x01",
+    "\x02",
+    "\x03",
+    "\x04",
+    "\x05",
+    "\x06",
+    "\x07",
+    "\x08",
+    "\x0b",
+    "\x0c",
+    "\x0e",
+    "\x0f",
+}
+
+WORD_RE = re.compile(
+    r"\S+",
+    flags=re.UNICODE,
+)
+
+
+# ============================================================
+# TEXT CLEANING
+# ============================================================
+
+def clean_text(text: str) -> str:
+    """
+    Remove structural/control characters from the corpus.
+
+    In particular, removes the paragraph marker that was
+    appearing as:
+
+        ¶
+    """
+
+    for token in CONTROL_TOKENS:
+        text = text.replace(token, " ")
+
+    # Remove zero-width/control formatting characters.
+    text = text.replace("\ufeff", " ")
+    text = text.replace("\u200b", "")
+    text = text.replace("\u200c", "")
+    text = text.replace("\u200d", "")
+
+    return text
+
+
+def tokenize(text: str) -> List[str]:
+    """
+    Simple whitespace tokenizer.
+
+    This deliberately preserves punctuation attached to words,
+    matching the original trigram approach.
+    """
+
+    text = clean_text(text)
+
+    words = WORD_RE.findall(text)
+
+    words = [
+        word
+        for word in words
+        if word
+        and word not in CONTROL_TOKENS
+        and not word.isspace()
+    ]
+
+    return words
+
+
+# ============================================================
+# CORPUS LOADING
+# ============================================================
+
+def load_corpus(
+    file_path: str | Path,
+) -> List[str]:
+
+    path = Path(file_path)
+
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Corpus file not found: {path}"
+        )
+
+    text = path.read_text(
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    words = tokenize(text)
+
+    if len(words) < 3:
+        raise ValueError(
+            "Corpus must contain at least 3 usable words."
+        )
+
+    return words
+
+
+# ============================================================
+# TRIGRAM MODEL
+# ============================================================
+
+def build_trigram_model(
+    words: List[str],
+) -> Dict[Tuple[str, str], Counter]:
+    """
+    Build:
+
+        (word1, word2) -> Counter(next_word)
+
+    Example:
+
+        ("in", "front")
+            ->
+            {
+                "of": 120
+            }
+
+    This is the contextual language model.
+    """
+
+    model = defaultdict(Counter)
+
+    for i in range(len(words) - 2):
+
+        w1 = words[i]
+        w2 = words[i + 1]
+        w3 = words[i + 2]
+
+        if (
+            w1 in CONTROL_TOKENS
+            or w2 in CONTROL_TOKENS
+            or w3 in CONTROL_TOKENS
+        ):
+            continue
+
+        model[(w1, w2)][w3] += 1
+
+    return dict(model)
+
+
+# ============================================================
+# GLOBAL TRIGRAM FREQUENCIES
+# ============================================================
+
+def build_global_next_word_frequency(
+    words: List[str],
+) -> Counter:
+
+    counter = Counter()
+
+    for i in range(len(words) - 2):
+
+        next_word = words[i + 2]
+
+        if next_word not in CONTROL_TOKENS:
+            counter[next_word] += 1
+
+    return counter
+
+
+# ============================================================
+# TEMPERATURE
+# ============================================================
+
+def temperature_scale(
+    probabilities: np.ndarray,
+    temperature: float,
+) -> np.ndarray:
+    """
+    Temperature transform:
+
+        p' = p^(1/T) / sum(p^(1/T))
+
+    T > 1:
+        flattens the distribution
+
+    T < 1:
+        sharpens the distribution
+    """
+
+    if temperature <= 0:
+        raise ValueError(
+            "Temperature must be > 0."
+        )
+
+    probabilities = np.asarray(
+        probabilities,
+        dtype=np.float64,
+    )
+
+    probabilities = np.maximum(
+        probabilities,
+        1e-15,
+    )
+
+    scaled = probabilities ** (
+        1.0 / temperature
+    )
+
+    total = scaled.sum()
+
+    if total <= 0 or not np.isfinite(total):
+        return np.ones_like(
+            probabilities
+        ) / len(probabilities)
+
+    return scaled / total
+
+
+# ============================================================
+# FREQUENCY → BERNOULLI
+# ============================================================
+
+def probability_to_theta(
+    probability: float,
+) -> float:
+    """
+    Bernoulli state preparation:
+
+        |psi> =
+            sqrt(1-p)|0>
+            +
+            sqrt(p)|1>
+
+    produced by:
+
+        RY(theta)
+
+    where:
+
+        theta = 2 asin(sqrt(p))
+    """
+
+    p = float(
+        np.clip(
+            probability,
+            0.0,
+            1.0,
+        )
+    )
+
+    return float(
+        2.0 * math.asin(
+            math.sqrt(p)
+        )
+    )
+
+
+# ============================================================
+# CONTEXT PROBABILITY MODEL
+# ============================================================
+
+def contextual_probabilities(
+    candidate_counter: Counter,
+    temperature: float,
+):
+    """
+    Convert contextual frequencies into temperature-smoothed
+    probabilities.
+    """
+
+    candidates = list(
+        candidate_counter.keys()
+    )
+
+    frequencies = np.asarray(
+        [
+            candidate_counter[word]
+            for word in candidates
+        ],
+        dtype=np.float64,
+    )
+
+    total = frequencies.sum()
+
+    if total <= 0:
+        probabilities = np.ones(
+            len(candidates),
+            dtype=np.float64,
+        ) / len(candidates)
+
+    else:
+        probabilities = (
+            frequencies / total
+        )
+
+    probabilities = temperature_scale(
+        probabilities,
+        temperature,
+    )
+
+    return (
+        candidates,
+        frequencies,
+        probabilities,
+    )
+
+
+# ============================================================
+# FREQUENCY MODEL DISPLAY
+# ============================================================
+
+def print_context_model(
+    context_model,
+    max_contexts: int = 20,
+):
+
+    print()
+    print("=" * 80)
+    print("TOP CONTEXTUAL TRIGRAM FREQUENCIES")
+    print("=" * 80)
+
+    ranked_contexts = sorted(
+        context_model.items(),
+        key=lambda item: sum(
+            item[1].values()
+        ),
+        reverse=True,
+    )
+
+    for context, counter in ranked_contexts[
+        :max_contexts
+    ]:
+
+        total = sum(
+            counter.values()
+        )
+
+        candidates = counter.most_common(5)
+
+        candidate_text = ", ".join(
+            f"{word}:{freq}"
+            for word, freq in candidates
+        )
+
+        print(
+            f"{context!r} "
+            f"total={total} "
+            f"-> {candidate_text}"
+        )
+
+
+# ============================================================
+# QUANTUM CIRCUIT COMPILER
+# ============================================================
+
+def compile_frequency_circuit(
+    probabilities: np.ndarray,
+    num_qubits: int,
+    output_file: str | Path,
+):
+    """
+    Compile frequency statistics into a quantum circuit.
+
+    The probabilities are converted into Bernoulli parameters.
+
+    For each qubit, the probability is projected onto the
+    corresponding frequency statistic.
+
+    Additional gates create mixing and cross-coupling.
+
+    The circuit remains compatible with the supplied
+    ry:<angle>:<qubit> and cx:<control>:<target> syntax.
+    """
+
+    if num_qubits <= 0:
+        raise ValueError(
+            "num_qubits must be positive."
+        )
+
+    lines = []
+
+    lines.append(
+        "# Frequency-conditioned ML optical circuit"
+    )
+
+    lines.append(
+        "# theta = 2 * asin(sqrt(p))"
+    )
+
+    lines.append("")
+
+    # --------------------------------------------------------
+    # Map probability statistics onto qubits
+    # --------------------------------------------------------
+
+    n = len(probabilities)
+
+    # If there are fewer probabilities than qubits,
+    # pad using the mean probability.
+    if n < num_qubits:
+
+        mean_p = float(
+            np.mean(probabilities)
+        )
+
+        mapped = np.full(
+            num_qubits,
+            mean_p,
+            dtype=np.float64,
+        )
+
+        mapped[:n] = probabilities
+
+    else:
+
+        # Group probabilities into num_qubits bins.
+        mapped = np.zeros(
+            num_qubits,
+            dtype=np.float64,
+        )
+
+        for i, p in enumerate(
+            probabilities
+        ):
+            mapped[
+                i % num_qubits
+            ] += p
+
+        total = mapped.sum()
+
+        if total > 0:
+            mapped /= total
+
+    # --------------------------------------------------------
+    # Normalize the Bernoulli parameters.
+    #
+    # We want each individual qubit probability to remain
+    # useful rather than all probability mass being assigned
+    # to one qubit.
+    # --------------------------------------------------------
+
+    max_p = float(
+        np.max(mapped)
+    )
+
+    if max_p > 1.0:
+        mapped /= max_p
+
+    # --------------------------------------------------------
+    # Bernoulli initialisation
+    # --------------------------------------------------------
+
+    lines.append(
+        "# Frequency Bernoulli initialisation"
+    )
+
+    for q in range(num_qubits):
+
+        p = float(
+            np.clip(
+                mapped[q],
+                0.0,
+                1.0,
+            )
+        )
+
+        theta = probability_to_theta(p)
+
+        lines.append(
+            f"ry:{theta:.8f}:{q}"
+        )
+
+    lines.append("")
+
+    # --------------------------------------------------------
+    # Frequency gradient
+    # --------------------------------------------------------
+
+    lines.append(
+        "# Frequency-gradient coupling"
+    )
+
+    for q in range(num_qubits - 1):
+
+        p1 = mapped[q]
+        p2 = mapped[q + 1]
+
+        difference = abs(
+            float(p1 - p2)
+        )
+
+        similarity = 1.0 - min(
+            difference,
+            1.0,
+        )
+
+        if similarity >= 0.25:
+
+            lines.append(
+                f"cx:{q}:{q + 1}"
+            )
+
+    lines.append("")
+
+    # --------------------------------------------------------
+    # Bias correction
+    # --------------------------------------------------------
+
+    mean_p = float(
+        np.mean(mapped)
+    )
+
+    bias_p = float(
+        np.clip(
+            mean_p * 2.0,
+            0.0,
+            1.0,
+        )
+    )
+
+    bias_theta = probability_to_theta(
+        bias_p
+    )
+
+    lines.append(
+        "# Global frequency bias correction"
+    )
+
+    for q in range(num_qubits):
+
+        lines.append(
+            f"ry:{bias_theta:.8f}:{q}"
+        )
+
+    lines.append("")
+
+    # --------------------------------------------------------
+    # Cross coupling
+    # --------------------------------------------------------
+
+    lines.append(
+        "# Cross-frequency coupling"
+    )
+
+    if num_qubits >= 4:
+
+        half = num_qubits // 2
+
+        lines.append(
+            f"cx:0:{half}"
+        )
+
+        lines.append(
+            f"cx:{half - 1}:{num_qubits - 1}"
+        )
+
+    if num_qubits >= 8:
+
+        lines.append(
+            f"cx:1:{num_qubits - 1}"
+        )
+
+        lines.append(
+            f"cx:2:{num_qubits - 2}"
+        )
+
+    lines.append("")
+
+    # --------------------------------------------------------
+    # Final mixing
+    # --------------------------------------------------------
+
+    lines.append(
+        "# Final quantum mixing"
+    )
+
+    for q in range(num_qubits):
+
+        lines.append(
+            f"ry:{math.pi / 2:.8f}:{q}"
+        )
+
+    lines.append("")
+
+    output_file = Path(
+        output_file
+    )
+
+    output_file.write_text(
+        "\n".join(lines),
+        encoding="utf-8",
+    )
+
+    return output_file
+
+
+# ============================================================
+# OPTICAL MEASUREMENT DISTRIBUTION
+# ============================================================
+
+def normalize_counts(
+    counts: Dict[str, int],
+):
+    """
+    Convert measurement counts into probabilities.
+    """
+
+    if not counts:
+        raise ValueError(
+            "Optical backend returned no counts."
+        )
+
+    bitstrings = list(
+        counts.keys()
+    )
+
+    values = np.asarray(
+        [
+            counts[b]
+            for b in bitstrings
+        ],
+        dtype=np.float64,
+    )
+
+    total = values.sum()
+
+    if total <= 0:
+        raise ValueError(
+            "Optical measurement count total is zero."
+        )
+
+    probabilities = (
+        values / total
+    )
+
+    return (
+        bitstrings,
+        probabilities,
+    )
+
+
+# ============================================================
+# OPTICAL SCORE
+# ============================================================
+
+def optical_index_distribution(
+    counts: Dict[str, int],
+    candidate_count: int,
+):
+    """
+    Fold the optical computational basis into the contextual
+    candidate set.
+
+    Unlike the original implementation, the result is returned
+    as a probability distribution over candidates.
+    """
+
+    if candidate_count <= 0:
+        raise ValueError(
+            "candidate_count must be > 0."
+        )
+
+    bitstrings, probabilities = (
+        normalize_counts(counts)
+    )
+
+    candidate_probabilities = np.zeros(
+        candidate_count,
+        dtype=np.float64,
+    )
+
+    for bitstring, p in zip(
+        bitstrings,
+        probabilities,
+    ):
+
+        try:
+            state = int(
+                bitstring,
+                2,
+            )
+
+        except ValueError:
+            continue
+
+        index = (
+            state %
+            candidate_count
+        )
+
+        candidate_probabilities[
+            index
+        ] += p
+
+    total = (
+        candidate_probabilities.sum()
+    )
+
+    if total <= 0:
+
+        candidate_probabilities[:] = (
+            1.0 /
+            candidate_count
+        )
+
+    else:
+
+        candidate_probabilities /= total
+
+    return candidate_probabilities
+
+
+# ============================================================
+# COMBINE ML + OPTICAL PROBABILITIES
+# ============================================================
+
+def combine_probabilities(
+    language_probabilities: np.ndarray,
+    optical_probabilities: np.ndarray,
+    quantum_strength: float,
+):
+    """
+    Combine contextual language probability with the optical
+    measurement probability.
+
+        P(final) =
+            P(language)^(1-s)
+            *
+            P(optical)^s
+
+    followed by normalization.
+
+    quantum_strength = 0:
+        pure language model
+
+    quantum_strength = 1:
+        pure optical distribution
+    """
+
+    s = float(
+        np.clip(
+            quantum_strength,
+            0.0,
+            1.0,
+        )
+    )
+
+    language_probabilities = np.asarray(
+        language_probabilities,
+        dtype=np.float64,
+    )
+
+    optical_probabilities = np.asarray(
+        optical_probabilities,
+        dtype=np.float64,
+    )
+
+    language_probabilities = np.maximum(
+        language_probabilities,
+        1e-12,
+    )
+
+    optical_probabilities = np.maximum(
+        optical_probabilities,
+        1e-12,
+    )
+
+    combined = (
+        language_probabilities
+        ** (1.0 - s)
+    ) * (
+        optical_probabilities
+        ** s
+    )
+
+    total = combined.sum()
+
+    if total <= 0:
+        return (
+            np.ones_like(
+                combined
+            ) /
+            len(combined)
+        )
+
+    return combined / total
+
+
+# ============================================================
+# SAMPLE NEXT WORD
+# ============================================================
+
+def sample_next_word(
+    counts: Dict[str, int],
+    candidate_counter: Counter,
+    temperature: float,
+    quantum_strength: float,
+):
+    """
+    Select a word using both:
+
+        1. contextual frequency
+        2. optical measurement
+
+    The quantum circuit therefore influences the final
+    probability instead of simply selecting an arbitrary
+    modulo index.
+    """
+
+    (
+        candidates,
+        frequencies,
+        language_probabilities,
+    ) = contextual_probabilities(
+        candidate_counter,
+        temperature,
+    )
+
+    optical_probabilities = (
+        optical_index_distribution(
+            counts,
+            len(candidates),
+        )
+    )
+
+    final_probabilities = (
+        combine_probabilities(
+            language_probabilities,
+            optical_probabilities,
+            quantum_strength,
+        )
+    )
+
+    index = np.random.choice(
+        len(candidates),
+        p=final_probabilities,
+    )
+
+    return (
+        candidates[index],
+        final_probabilities,
+    )
+
+
+# ============================================================
+# FIND START CONTEXT
+# ============================================================
+
+def choose_initial_context(
+    context_model,
+):
+    """
+    Select an initial context weighted by the number of
+    continuations it has learned.
+    """
+
+    contexts = list(
+        context_model.keys()
+    )
+
+    if not contexts:
+        raise ValueError(
+            "Context model is empty."
+        )
+
+    weights = np.asarray(
+        [
+            sum(
+                context_model[c].values()
+            )
+            for c in contexts
+        ],
+        dtype=np.float64,
+    )
+
+    weights /= weights.sum()
+
+    index = np.random.choice(
+        len(contexts),
+        p=weights,
+    )
+
+    return contexts[index]
+
+
+# ============================================================
+# PROMPT CONTEXT
+# ============================================================
+
+def find_prompt_context(
+    prompt: str,
+    context_model,
+):
+    """
+    Use the last two words of a prompt when that context
+    exists in the learned model.
+
+    If it does not exist, progressively fall back to a
+    learned context.
+    """
+
+    prompt_words = tokenize(
+        prompt
+    )
+
+    if len(prompt_words) >= 2:
+
+        context = (
+            prompt_words[-2],
+            prompt_words[-1],
+        )
+
+        if context in context_model:
+            return context
+
+    return choose_initial_context(
+        context_model
+    )
+
+
+# ============================================================
+# GENERATION
+# ============================================================
+
+def generate_text(
+    context_model,
+    counts,
+    length: int,
+    temperature: float,
+    quantum_strength: float,
+    prompt: str = "",
+):
+    """
+    Contextual optical generation.
+
+    Each step:
+
+        previous two words
+              |
+              v
+        contextual candidates
+              |
+              +---- corpus frequency
+              |
+              +---- optical measurement
+              |
+              v
+        combined probability
+              |
+              v
+        next word
+    """
+
+    context = find_prompt_context(
+        prompt,
+        context_model,
+    )
+
+    output = []
+
+    if prompt.strip():
+
+        prompt_words = tokenize(
+            prompt
+        )
+
+        output.extend(
+            prompt_words
+        )
+
+    else:
+
+        output.extend(
+            [
+                context[0],
+                context[1],
+            ]
+        )
+
+    # Avoid repeatedly adding the prompt context.
+    current_w1 = context[0]
+    current_w2 = context[1]
+
+    while len(output) < length:
+
+        candidate_counter = (
+            context_model.get(
+                (
+                    current_w1,
+                    current_w2,
+                )
+            )
+        )
+
+        if not candidate_counter:
+
+            # Back off to a learned context.
+            context = choose_initial_context(
+                context_model
+            )
+
+            current_w1 = context[0]
+            current_w2 = context[1]
+
+            continue
+
+        next_word, _ = sample_next_word(
+            counts=counts,
+            candidate_counter=candidate_counter,
+            temperature=temperature,
+            quantum_strength=quantum_strength,
+        )
+
+        output.append(
+            next_word
+        )
+
+        current_w1 = current_w2
+        current_w2 = next_word
+
+    return " ".join(
+        output[:length]
+    )
+
+
+# ============================================================
+# PRINT QUANTUM PARAMETERS
+# ============================================================
+
+def print_quantum_parameters(
+    candidates,
+    probabilities,
+):
+    """
+    Display the frequency-derived Bernoulli parameters.
+    """
+
+    print()
+    print("=" * 80)
+    print("FREQUENCY → PROBABILITY → RY")
+    print("=" * 80)
+
+    for i, (
+        candidate,
+        probability,
+    ) in enumerate(
+        zip(
+            candidates,
+            probabilities,
+        )
+    ):
+
+        theta = probability_to_theta(
+            probability
+        )
+
+        print(
+            f"{i:4d} "
+            f"p={probability:.8f} "
+            f"theta={theta:.8f} "
+            f"word={candidate}"
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Contextual frequency-conditioned "
+            "optical quantum text generator."
+        )
+    )
+
+    parser.add_argument(
+        "--corpus",
+        required=True,
+        help="Path to corpus text file.",
+    )
+
+    parser.add_argument(
+        "--qubits",
+        type=int,
+        default=8,
+        help="Number of optical/quantum qubits.",
+    )
+
+    parser.add_argument(
+        "--shots",
+        type=int,
+        default=1024,
+        help="Number of optical measurements.",
+    )
+
+    parser.add_argument(
+        "--length",
+        type=int,
+        default=100,
+        help="Number of generated words.",
+    )
+
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.25,
+        help=(
+            "Language-model temperature. "
+            "Higher values flatten frequencies."
+        ),
+    )
+
+    parser.add_argument(
+        "--quantum-strength",
+        type=float,
+        default=0.50,
+        help=(
+            "0 = language model only, "
+            "1 = optical distribution only."
+        ),
+    )
+
+    parser.add_argument(
+        "--script",
+        type=str,
+        default=None,
+        help=(
+            "Optional pre-existing quantum .q script. "
+            "If omitted, the circuit is generated from "
+            "corpus frequencies."
+        ),
+    )
+
+    parser.add_argument(
+        "--generated-script",
+        type=str,
+        default="frequency_ml.q",
+        help="Generated quantum circuit filename.",
+    )
+
+    parser.add_argument(
+        "--port",
+        type=str,
+        default="COM7",
+        help="ITO controller serial port.",
+    )
+
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default="",
+        help=(
+            "Initial prompt. "
+            "The last two words are used as trigram context "
+            "when that context exists in the corpus."
+        ),
+    )
+
+    parser.add_argument(
+        "--real-camera",
+        action="store_true",
+        help=(
+            "Use OpticalCamera instead of SyntheticCamera."
+        ),
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help="Random seed.",
+    )
+
+    parser.add_argument(
+        "--show-model",
+        action="store_true",
+        help="Print contextual frequency statistics.",
+    )
+
+    args = parser.parse_args()
+
+    # ========================================================
+    # RANDOM SEEDS
+    # ========================================================
+
+    random.seed(
+        args.seed
+    )
+
+    np.random.seed(
+        args.seed
+    )
+
+    # ========================================================
+    # LOAD CORPUS
+    # ========================================================
+
+    words = load_corpus(
+        args.corpus
+    )
+
+    print(
+        f"Loaded corpus: {len(words)} words"
+    )
+
+    # ========================================================
+    # BUILD CONTEXT MODEL
+    # ========================================================
+
+    context_model = build_trigram_model(
+        words
+    )
+
+    print(
+        f"Contexts: {len(context_model)}"
+    )
+
+    global_frequency = (
+        build_global_next_word_frequency(
+            words
+        )
+    )
+
+    print(
+        f"Unique next words: "
+        f"{len(global_frequency)}"
+    )
+
+    if args.show_model:
+
+        print_context_model(
+            context_model
+        )
+
+    # ========================================================
+    # CREATE GLOBAL FREQUENCY DISTRIBUTION
+    #
+    # This determines the initial quantum circuit.
+    # ========================================================
+
+    global_words = list(
+        global_frequency.keys()
+    )
+
+    global_frequencies = np.asarray(
+        [
+            global_frequency[w]
+            for w in global_words
+        ],
+        dtype=np.float64,
+    )
+
+    global_probabilities = (
+        global_frequencies /
+        global_frequencies.sum()
+    )
+
+    global_probabilities = (
+        temperature_scale(
+            global_probabilities,
+            args.temperature,
+        )
+    )
+
+    # ========================================================
+    # PRINT FREQUENCY → RY
+    # ========================================================
+
+    print_quantum_parameters(
+        global_words[: min(
+            len(global_words),
+            32,
+        )],
+        global_probabilities[
+            : min(
+                len(global_probabilities),
+                32,
+            )
+        ],
+    )
+
+    # ========================================================
+    # COMPILE CIRCUIT
+    # ========================================================
+
+    if args.script:
+
+        circuit_path = Path(
+            args.script
+        )
+
+    else:
+
+        circuit_path = (
+            compile_frequency_circuit(
+                probabilities=global_probabilities,
+                num_qubits=args.qubits,
+                output_file=args.generated_script,
+            )
+        )
+
+    print()
+    print(
+        f"Quantum circuit: {circuit_path}"
+    )
+
+    # ========================================================
+    # CAMERA
+    # ========================================================
+
+    if args.real_camera:
+
+        camera = OpticalCamera(
+            width=256,
+            height=256,
+        )
+
+    else:
+
+        camera = SyntheticCamera(
+            width=256,
+            height=256,
+            seed=args.seed,
+        )
+
+    # ========================================================
+    # ITO
+    # ========================================================
+
+    ito = ITOController(
+        port=args.port
+    )
+
+    # ========================================================
+    # OPTICAL BENCH
+    # ========================================================
+
+    bench = OpticalBench(
+        camera=camera,
+        rows=16,
+        cols=16,
+    )
+
+    # ========================================================
+    # OPTICAL BACKEND
+    # ========================================================
+
+    optical_backend = OpticalBackend(
+        bench=bench,
+        ito=ito,
+        num_qubits=args.qubits,
+        spatial_rows=16,
+        spatial_cols=16,
+        temporal_bins=2,
+    )
+
+    # ========================================================
+    # QUANTUM COMPUTER
+    # ========================================================
+
+    computer = GeneralQuantumComputer(
+        num_qubits=args.qubits,
+        optical_backend=optical_backend,
+    )
+
+    # ========================================================
+    # PARSE QUANTUM CIRCUIT
+    # ========================================================
+
+    operations = parse_q_file(
+        str(circuit_path)
+    )
+
+    qc = parse_operations(
+        operations,
+        args.qubits,
+    )
+
+    # ========================================================
+    # RUN OPTICAL CIRCUIT
+    # ========================================================
+
+    print()
+    print("=" * 80)
+    print("RUNNING OPTICAL QUANTUM CIRCUIT")
+    print("=" * 80)
+
+    result = computer.run_optical(
+        qc,
+        shots=args.shots,
+    )
+
+    # ========================================================
+    # CLOSE HARDWARE
+    # ========================================================
+
+    try:
+        camera.close()
+    except Exception:
+        pass
+
+    try:
+        ito.close()
+    except Exception:
+        pass
+
+    # ========================================================
+    # MEASUREMENT COUNTS
+    # ========================================================
+
+    print()
+    print("=" * 80)
+    print("OPTICAL MEASUREMENT")
+    print("=" * 80)
+
+    for bitstring, count in sorted(
+        result.counts.items(),
+        key=lambda item: -item[1],
+    ):
+
+        print(
+            f"{bitstring}: {count}"
+        )
+
+    # ========================================================
+    # GENERATE
+    # ========================================================
+
+    print()
+    print("=" * 80)
+    print("GENERATING")
+    print("=" * 80)
+
+    output = generate_text(
+        context_model=context_model,
+        counts=result.counts,
+        length=500,
+        temperature=args.temperature,
+        quantum_strength=args.quantum_strength,
+        prompt=args.prompt,
+    )
+
+    # ========================================================
+    # OUTPUT
+    # ========================================================
+
+    print()
+    print("=" * 80)
+    print("GENERATED TEXT")
+    print("=" * 80)
+
+    print(output)
+
+    print()
+    print("=" * 80)
+    print("GENERATION PARAMETERS")
+    print("=" * 80)
+
+    print(
+        f"temperature       = "
+        f"{args.temperature}"
+    )
+
+    print(
+        f"quantum_strength  = "
+        f"{args.quantum_strength}"
+    )
+
+    print(
+        f"qubits            = "
+        f"{args.qubits}"
+    )
+
+    print(
+        f"shots             = "
+        f"{args.shots}"
+    )
+
+
+if __name__ == "__main__":
+    main()

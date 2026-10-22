@@ -1,0 +1,656 @@
+#!/usr/bin/env python3
+"""neural_llm_gui.py — corpus n-gram completion with an optional MRI-inspired graph and camera HUD.
+
+Dependencies: numpy scipy opencv-python pillow; nibabel is optional for NIfTI MRI files.
+The graph/HUD are experimental visualizations, not medical image analysis or a clinical classifier.
+"""
+import os, re, random, threading, queue
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox, filedialog
+import numpy as np
+import scipy.sparse as sp
+from scipy.sparse.csgraph import connected_components
+from scipy.spatial import cKDTree
+from scipy.ndimage import gaussian_filter, label, center_of_mass
+import cv2
+from PIL import Image, ImageTk
+
+PAD, UNK, BOS, EOS = "<pad>", "<unk>", "<bos>", "<eos>"
+TOKEN_RE = re.compile(r"[a-z0-9']+|[.,!?;:]")
+SENT_SPLIT = re.compile(r"(?<=[.!?])\s+|\n{2,}")
+WORD_RE = re.compile(r"[a-z0-9']+")
+
+
+def load_sentences(path):
+    with open(path, encoding="utf-8") as f:
+        raw = f.read().lower()
+    return [tokens for part in SENT_SPLIT.split(raw) if len(tokens := TOKEN_RE.findall(part)) >= 2]
+
+
+def detok(tokens):
+    return re.sub(r"\s+([.,!?;:])", r"\1", " ".join(tokens))
+
+
+class Vocab:
+    def __init__(self, sentences):
+        counts = Counter(t for sent in sentences for t in sent)
+        words = sorted(counts, key=lambda t: (-counts[t], t))
+        self.itos = [PAD, UNK, BOS, EOS] + words
+        self.stoi = {t: i for i, t in enumerate(self.itos)}
+        self.pad, self.unk, self.bos, self.eos = range(4)
+        self.V = len(self.itos)
+        self.counts = np.zeros(self.V, dtype=np.float64)
+        for word, count in counts.items():
+            self.counts[self.stoi[word]] = count
+
+    def encode(self, tokens):
+        return [self.stoi.get(t, self.unk) for t in tokens]
+
+
+class NGram:
+    def __init__(self, vocab, order=2, lam=0.72, smoothing=0.05):
+        self.vocab, self.order, self.lam, self.smoothing = vocab, max(1, int(order)), lam, smoothing
+        self.tables = [defaultdict(Counter) for _ in range(self.order + 1)]
+        self.base = np.zeros(vocab.V, dtype=np.float64)
+
+    def fit(self, sequences):
+        sequences = list(sequences)
+        for seq in sequences:
+            for i in range(1, len(seq)):
+                for n in range(min(self.order, i) + 1):
+                    self.tables[n][tuple(seq[i-n:i])][seq[i]] += 1
+        base = self.vocab.counts.copy()
+        base[self.vocab.eos] = max(1, len(sequences))
+        base[[self.vocab.pad, self.vocab.bos, self.vocab.unk]] = 0
+        base += self.smoothing
+        base[[self.vocab.pad, self.vocab.bos, self.vocab.unk]] = 0
+        total = float(base.sum())
+        self.base = base / total if total > 0 else np.full(self.vocab.V, 1 / self.vocab.V)
+
+    def dist(self, context):
+        p = self.base.copy()
+        context = tuple(context[-self.order:])
+        for n in range(len(context) + 1):
+            key = context[-n:] if n else ()
+            counts = self.tables[n].get(key)
+            if counts:
+                row = np.zeros(self.vocab.V, dtype=np.float64)
+                for token, count in counts.items():
+                    row[token] = count
+                total = float(row.sum())
+                if total > 0:
+                    p = self.lam * (row / total) + (1 - self.lam) * p
+        return p
+
+    def logits(self, context):
+        p = self.dist(context)
+        logits = np.log(np.maximum(p, 1e-300))
+        logits[[self.vocab.pad, self.vocab.bos, self.vocab.unk]] = -np.inf
+        return logits
+
+
+def pick(logits, temperature=0.9, top_k=40):
+    """Sample safely; never ask NumPy to interpret an array as a boolean."""
+    logits = np.asarray(logits, dtype=np.float64).reshape(-1).copy()
+    finite = np.isfinite(logits)
+    if not bool(np.any(finite)):
+        raise ValueError("No valid next-token logits. Check that the corpus has usable text.")
+    k = int(top_k)
+    if k > 0 and k < int(np.count_nonzero(finite)):
+        valid_indices = np.flatnonzero(finite)
+        keep = valid_indices[np.argpartition(logits[valid_indices], -k)[-k:]]
+        mask = np.zeros(logits.shape, dtype=bool)
+        mask[keep] = True
+        logits[~mask] = -np.inf
+    temperature = max(float(temperature), 1e-3)
+    finite = np.isfinite(logits)
+    scaled = logits[finite] / temperature
+    scaled -= float(np.max(scaled))
+    probs = np.exp(scaled)
+    total = float(probs.sum())
+    if not np.isfinite(total) or total <= 0:
+        raise ValueError("Could not form a valid next-token distribution.")
+    probs /= total
+    choices = np.flatnonzero(finite)
+    return int(np.random.choice(choices, p=probs))
+
+
+def generate(model, vocab, prompt, max_new=40, temperature=0.9, top_k=40, stop_at_eos=True):
+    tokens = TOKEN_RE.findall(prompt.lower())
+    if not tokens:
+        raise ValueError("Enter a prompt containing at least one word or punctuation token.")
+    context = [vocab.bos] + vocab.encode(tokens)
+    result = []
+    for _ in range(max(1, int(max_new))):
+        logits = model.logits(context)
+        nxt = pick(logits, temperature, top_k)
+        if stop_at_eos and nxt == vocab.eos:
+            break
+        result.append(nxt)
+        context.append(nxt)
+    return detok(tokens + [vocab.itos[i] for i in result])
+
+
+def synthetic_volume(shape=(48, 48, 32), seed=3):
+    rng = np.random.default_rng(seed)
+    z, y, x = np.meshgrid(*(np.linspace(-1, 1, n) for n in shape), indexing="ij")
+    mask = x*x/0.82 + y*y/0.95 + z*z/0.72 < 1
+    noise = gaussian_filter(rng.normal(size=shape).astype(np.float32), 1.2)
+    volume = np.clip(0.58 + 0.35 * noise, 0, 1) * mask
+    return volume.astype(np.float32)
+
+
+def read_volume(path):
+    if not path or not os.path.isfile(path):
+        return synthetic_volume(), "Synthetic MRI-like volume (no file selected)"
+    try:
+        import nibabel as nib
+    except ImportError as exc:
+        raise RuntimeError("To load a .nii/.nii.gz MRI, install nibabel: pip install nibabel") from exc
+    img = nib.load(path)
+    data = np.asarray(img.get_fdata(), dtype=np.float32)
+    if data.ndim > 3:
+        data = data[..., 0]
+    if data.ndim != 3:
+        raise ValueError("MRI file must contain a 3-D volume.")
+    data = data[::4, ::4, ::4]
+    finite = np.isfinite(data)
+    if not bool(np.any(finite)):
+        raise ValueError("MRI volume has no finite voxels.")
+    positive = data[finite & (data > 0)]
+    scale = float(np.percentile(positive, 99)) if positive.size else float(np.max(np.abs(data[finite])))
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError("MRI volume has no positive intensity range.")
+    data = np.nan_to_num(data / scale, nan=0.0, posinf=1.0, neginf=0.0)
+    return np.clip(data, 0, 1).astype(np.float32), "Loaded MRI: " + os.path.basename(path)
+
+
+def make_voxel_graph(volume, threshold=0.25, max_nodes=12000):
+    mask = np.isfinite(volume) & (volume > threshold)
+    coords = np.argwhere(mask)
+    if len(coords) < 2:
+        raise ValueError("Too few voxels above the selected threshold to build a graph.")
+    if len(coords) > max_nodes:
+        choose = np.linspace(0, len(coords)-1, max_nodes).astype(int)
+        coords = coords[choose]
+    # Connect each sampled voxel to its nearest spatial neighbours.
+    tree = cKDTree(coords.astype(np.float32))
+    k = min(5, len(coords))
+    distances, indices = tree.query(coords.astype(np.float32), k=k)
+    rows = np.repeat(np.arange(len(coords)), k-1)
+    cols = indices[:, 1:].reshape(-1)
+    dist = distances[:, 1:].reshape(-1)
+    weights = np.exp(-dist).astype(np.float32)
+    adj = sp.csr_matrix((weights, (rows, cols)), shape=(len(coords), len(coords)))
+    adj = adj.maximum(adj.T)
+    return coords, adj
+
+
+class CameraSensor:
+    """Live webcam feature learner whose feature projection is derived from the MRI graph.
+
+    No pretrained detector, external model weights, or OCR engine is used. OpenCV
+    proposes foreground regions from the live stream. The MRI voxel graph defines
+    a deterministic graph-conditioned projection of hand-crafted visual features.
+    To give a region a semantic name, the user teaches examples from the webcam.
+    """
+    def __init__(self, circuit, use_webcam=True, resolution=(640, 480), tau=4.0,
+                 rho=1.0, sigma=0.7, memory_path='visual_memory.json'):
+        self.circuit = circuit
+        self.resolution = tuple(map(int, resolution))
+        self.tau, self.rho, self.sigma = max(1.0, float(tau)), float(rho), max(0.1, float(sigma))
+        self.memory_path = memory_path
+        self.cap = None
+        self.last_color = None
+        self.last_gray = None
+        self.last_objects = []
+        self.state = np.zeros((self.resolution[1], self.resolution[0]), dtype=np.float32)
+        self.bg = cv2.createBackgroundSubtractorMOG2(history=180, varThreshold=24, detectShadows=False)
+        self.memory = []
+        self.graph_projection = self._make_graph_projection(circuit)
+        self._load_memory()
+        if use_webcam:
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                self.cap = cap
+            else:
+                cap.release()
+
+    def _make_graph_projection(self, circuit, out_dim=48):
+        """Construct a stable projection from MRI node coordinates and graph degrees."""
+        rng = np.random.default_rng(20261010)
+        if circuit is None or len(circuit.coords) == 0:
+            graph_signature = np.zeros((96, 4), dtype=np.float32)
+        else:
+            coords = np.asarray(circuit.coords, dtype=np.float32)
+            degree = np.asarray(circuit.adjacency.sum(axis=1)).reshape(-1).astype(np.float32)
+            degree /= max(float(degree.max()), 1e-6)
+            xyz = coords / np.maximum(np.asarray(coords.max(axis=0), dtype=np.float32), 1.0)
+            raw = np.column_stack((xyz, degree))
+            indices = np.linspace(0, len(raw)-1, 96).astype(int)
+            graph_signature = raw[indices]
+        graph_signature = np.tile(graph_signature, (1, 24))[:, :96]
+        weights = rng.normal(0, 1, (96, out_dim)).astype(np.float32) / np.sqrt(96.0)
+        return (graph_signature.T @ weights).astype(np.float32)
+
+    def capture(self):
+        if self.cap is None:
+            raise RuntimeError('The real webcam is not open. Check camera permissions or select device 0.')
+        ok, bgr = self.cap.read()
+        if not ok or bgr is None:
+            raise RuntimeError('The webcam did not return a video frame.')
+        color = cv2.resize(bgr, self.resolution, interpolation=cv2.INTER_AREA)
+        self.last_color = color
+        gray_u8 = cv2.cvtColor(color, cv2.COLOR_BGR2GRAY)
+        gray = gray_u8.astype(np.float32) / 255.0
+        gray = gaussian_filter(gray, sigma=self.sigma) * self.rho
+        self.state = (1 - 1/self.tau) * self.state + (1/self.tau) * gray
+        self.last_gray = gray_u8
+        self.last_objects = self.recognize()
+        return color.copy()
+
+    def _describe(self, roi):
+        roi = cv2.resize(roi, (64, 64), interpolation=cv2.INTER_AREA)
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1, 2], None, [4, 4, 4], [0, 180, 0, 256, 0, 256]).reshape(-1)
+        hist = hist.astype(np.float32)
+        hist /= max(float(np.linalg.norm(hist)), 1e-6)
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        small = cv2.resize(gray, (4, 4), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+        edge = cv2.Canny(gray, 60, 140)
+        edge_small = cv2.resize(edge, (4, 4), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+        base = np.concatenate((hist, small.reshape(-1), edge_small.reshape(-1))).astype(np.float32)
+        graph_features = np.tanh(base @ self.graph_projection)
+        descriptor = np.concatenate((base, graph_features)).astype(np.float32)
+        return descriptor / max(float(np.linalg.norm(descriptor)), 1e-6)
+
+    def recognize(self):
+        if self.last_color is None:
+            return []
+        frame = self.last_color
+        h, w = frame.shape[:2]
+        mask = self.bg.apply(frame)
+        mask = cv2.medianBlur(mask, 5)
+        _, mask = cv2.threshold(mask, 200, 255, cv2.THRESH_BINARY)
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        found = []
+        min_area = max(700, int(w*h*0.008))
+        for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:10]:
+            x, y, bw, bh = cv2.boundingRect(contour)
+            if bw*bh < min_area or bw < 22 or bh < 22:
+                continue
+            roi = frame[y:y+bh, x:x+bw]
+            if roi.size == 0:
+                continue
+            descriptor = self._describe(roi)
+            name, confidence = self._classify(descriptor)
+            found.append({'name': name, 'source': 'MRI-graph visual memory' if name != 'untrained region' else 'untrained visual region',
+                          'confidence': confidence, 'bbox': (x, y, x+bw, y+bh),
+                          'pixel_pos': (x+bw/2, y+bh/2), 'descriptor': descriptor, 'area': int(bw*bh)})
+        self.last_objects = found
+        return found
+
+    def _classify(self, descriptor):
+        if not self.memory:
+            return 'untrained region', 0.0
+        best_label, best = 'untrained region', -1.0
+        for item in self.memory:
+            ref = np.asarray(item.get('descriptor', []), dtype=np.float32)
+            if ref.shape != descriptor.shape:
+                continue
+            score = float(np.dot(ref, descriptor) / max(float(np.linalg.norm(ref)*np.linalg.norm(descriptor)), 1e-6))
+            if score > best:
+                best, best_label = score, item['label']
+        return (best_label, float(np.clip(best, 0, 1))) if best >= 0.78 else ('untrained region', max(0.0, best))
+
+    def teach_largest_region(self, label):
+        label = re.sub(r'\s+', ' ', label.strip().lower())
+        if not label:
+            raise ValueError('Enter a vocabulary word or label first.')
+        if self.last_color is None:
+            raise ValueError('Start live video and wait for a foreground region to appear.')
+        objects = list(self.last_objects)
+        if not objects:
+            objects = self.recognize()
+        if not objects:
+            raise ValueError('No foreground region found. Hold the object against a mostly still background and move it slightly.')
+        target = max(objects, key=lambda obj: obj['area'])
+        self.memory.append({'label': label, 'descriptor': target['descriptor'].tolist()})
+        self._save_memory()
+        return label, target['bbox']
+
+    def _load_memory(self):
+        try:
+            if os.path.isfile(self.memory_path):
+                with open(self.memory_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    self.memory = [x for x in data if isinstance(x, dict) and isinstance(x.get('label'), str) and isinstance(x.get('descriptor'), list)]
+        except (OSError, ValueError, TypeError):
+            self.memory = []
+
+    def _save_memory(self):
+        temp = self.memory_path + '.tmp'
+        with open(temp, 'w', encoding='utf-8') as f:
+            json.dump(self.memory, f)
+        os.replace(temp, self.memory_path)
+
+    def close(self):
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+
+
+@dataclass
+class Circuit:
+    coords: np.ndarray
+    adjacency: sp.csr_matrix
+    component_count: int
+    info: str
+
+
+def build_circuit(mri_path, threshold):
+    volume, description = read_volume(mri_path)
+    coords, adj = make_voxel_graph(volume, threshold)
+    ncomp, _ = connected_components(adj, directed=False)
+    return Circuit(coords, adj, int(ncomp), description)
+
+
+class NeuralLLMApp:
+    def __init__(self, root):
+        self.root = root
+        root.title("Corpus LLM · MRI Graph · Object HUD")
+        root.geometry("1180x820")
+        self.sentences = None
+        self.vocab = None
+        self.model = None
+        self.circuit = None
+        self.camera = None
+        self.tk_image = None
+        self.worker = None
+        self.messages = queue.Queue()
+        self.live_video = False
+        self._live_after_id = None
+        self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.after(100, self._poll_messages)
+
+    def _build_ui(self):
+        tabs = ttk.Notebook(self.root)
+        tabs.pack(fill="both", expand=True, padx=8, pady=8)
+        setup = ttk.Frame(tabs); tabs.add(setup, text="Corpus & MRI")
+        camera = ttk.Frame(tabs); tabs.add(camera, text="Camera settings")
+        generation = ttk.Frame(tabs); tabs.add(generation, text="Generate & HUD")
+        self._build_setup(setup); self._build_camera(camera); self._build_generation(generation)
+
+    def _build_setup(self, parent):
+        ttk.Label(parent, text="Corpus and substrate initialization", font=("Arial", 12, "bold")).pack(anchor="w", padx=12, pady=12)
+        row = ttk.Frame(parent); row.pack(fill="x", padx=12, pady=5)
+        ttk.Label(row, text="Corpus text file:").pack(side="left")
+        self.corpus_path = ttk.Entry(row, width=62); self.corpus_path.pack(side="left", padx=6); self.corpus_path.insert(0, "data.txt")
+        ttk.Button(row, text="Browse", command=self._browse_corpus).pack(side="left")
+        row = ttk.Frame(parent); row.pack(fill="x", padx=12, pady=5)
+        ttk.Label(row, text="MRI NIfTI file (optional):").pack(side="left")
+        self.mri_path = ttk.Entry(row, width=58); self.mri_path.pack(side="left", padx=6)
+        ttk.Button(row, text="Browse", command=self._browse_mri).pack(side="left")
+        ttk.Button(parent, text="Initialize corpus model and MRI graph", command=self.initialize).pack(anchor="w", padx=12, pady=14)
+        self.status = ttk.Label(parent, text="Status: waiting for initialization", foreground="darkred", wraplength=1000)
+        self.status.pack(anchor="w", padx=12, pady=8)
+        ttk.Label(parent, text="No downloaded recognizer is used. Live webcam regions are described by built-in OpenCV features, transformed through the MRI-derived voxel graph, and labelled by examples you teach. NIfTI support requires nibabel.", wraplength=900).pack(anchor="w", padx=12, pady=5)
+
+    def _build_camera(self, parent):
+        ttk.Label(parent, text="Camera and spatial smoothing", font=("Arial", 12, "bold")).pack(anchor="w", padx=12, pady=12)
+        self.use_camera = tk.BooleanVar(value=True); self.use_webcam = tk.BooleanVar(value=True)
+        ttk.Checkbutton(parent, text="Enable real webcam video", variable=self.use_camera).pack(anchor="w", padx=12, pady=5)
+        ttk.Checkbutton(parent, text="Use webcam device 0", variable=self.use_webcam).pack(anchor="w", padx=12, pady=5)
+        row = ttk.Frame(parent); row.pack(fill="x", padx=12, pady=8)
+        ttk.Button(row, text="Start live video", command=self.start_live_video).pack(side="left", padx=(0, 8))
+        ttk.Button(row, text="Stop live video", command=self.stop_live_video).pack(side="left", padx=(0, 12))
+        ttk.Label(row, text="Teach label for largest region:").pack(side="left")
+        self.teach_label = ttk.Entry(row, width=22); self.teach_label.pack(side="left", padx=6)
+        ttk.Button(row, text="Learn from camera", command=self.teach_camera).pack(side="left")
+        self.tau = self._scale(parent, "Temporal integration τ", 1, 20, 4)
+        self.rho = self._scale(parent, "Input density ρ", 0.1, 3, 1)
+        self.sigma = self._scale(parent, "Smoothing σ", 0.1, 5, 1.2)
+        self.threshold = self._scale(parent, "MRI voxel threshold", 0.05, 0.8, 0.25)
+
+    def _scale(self, parent, label, low, high, value):
+        row = ttk.Frame(parent); row.pack(fill="x", padx=12, pady=7)
+        ttk.Label(row, text=label, width=26).pack(side="left")
+        var = tk.DoubleVar(value=value)
+        ttk.Scale(row, from_=low, to=high, variable=var, orient="horizontal").pack(side="left", fill="x", expand=True, padx=8)
+        ttk.Label(row, textvariable=var, width=7).pack(side="left")
+        return var
+
+    def _build_generation(self, parent):
+        row = ttk.Frame(parent); row.pack(fill="x", padx=10, pady=10)
+        ttk.Label(row, text="Prompt:").pack(side="left")
+        self.prompt = ttk.Entry(row, width=48); self.prompt.pack(side="left", padx=6); self.prompt.insert(0, "the old river")
+        ttk.Label(row, text="Tokens:").pack(side="left", padx=(8, 2))
+        self.max_tokens = tk.IntVar(value=40); ttk.Spinbox(row, from_=1, to=300, width=5, textvariable=self.max_tokens).pack(side="left")
+        ttk.Button(row, text="Generate", command=self.start_generation).pack(side="left", padx=8)
+        split = ttk.PanedWindow(parent, orient="horizontal"); split.pack(fill="both", expand=True, padx=10, pady=8)
+        left = ttk.Frame(split); right = ttk.Frame(split)
+        split.add(left, weight=3); split.add(right, weight=2)
+        self.output = scrolledtext.ScrolledText(left, wrap="word", font=("Consolas", 10)); self.output.pack(fill="both", expand=True)
+        ttk.Label(right, text="Visual object HUD", font=("Arial", 10, "bold")).pack(anchor="w")
+        self.canvas = tk.Canvas(right, width=360, height=300, bg="black", highlightthickness=1); self.canvas.pack(fill="both", expand=True, pady=4)
+        self.hud_text = ttk.Label(right, text="Initialize the model, then generate text.", wraplength=360, justify="left")
+        self.recognized_text = scrolledtext.ScrolledText(right, height=8, wrap="word", font=("Consolas", 9))
+        self.recognized_text.pack(fill="both", expand=True, pady=4)
+        self.hud_text.pack(fill="x", pady=5)
+
+    def _browse_corpus(self):
+        p = filedialog.askopenfilename(filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        if p: self.corpus_path.delete(0, "end"); self.corpus_path.insert(0, p)
+
+    def _browse_mri(self):
+        p = filedialog.askopenfilename(filetypes=[("NIfTI MRI", "*.nii *.nii.gz"), ("All files", "*.*")])
+        if p: self.mri_path.delete(0, "end"); self.mri_path.insert(0, p)
+
+
+    def initialize(self):
+        path = self.corpus_path.get().strip()
+        if not path:
+            messagebox.showerror("Corpus required", "Choose a text corpus file."); return
+        try:
+            if not os.path.isfile(path):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("The old river flows through the dark forest.\nMiners dig deep into the golden hills.\nThe water moves slowly through the valley.\n")
+            sentences = load_sentences(path)
+            if not sentences:
+                raise ValueError("The corpus contains no sentences with at least two tokens.")
+            vocab = Vocab(sentences)
+            model = NGram(vocab, order=2)
+            model.fit([[vocab.bos] + vocab.encode(s) + [vocab.eos] for s in sentences])
+            circuit = build_circuit(self.mri_path.get().strip(), float(self.threshold.get()))
+            camera = None
+            if self.use_camera.get():
+                camera = CameraSensor(circuit, self.use_webcam.get(), tau=self.tau.get(), rho=self.rho.get(), sigma=self.sigma.get())
+            if self.camera is not None: self.camera.close()
+            self.sentences, self.vocab, self.model, self.circuit, self.camera = sentences, vocab, model, circuit, camera
+            self.status.config(text=f"Ready: {len(sentences)} sentences, {vocab.V} vocabulary items, {len(circuit.coords)} graph nodes, {circuit.component_count} graph components. {circuit.info}", foreground="darkgreen")
+            messagebox.showinfo("Initialized", "Corpus model and MRI-inspired graph initialized.")
+        except Exception as exc:
+            self.status.config(text=f"Initialization error: {exc}", foreground="darkred")
+            messagebox.showerror("Initialization error", str(exc))
+
+    def start_live_video(self):
+        if self.camera is None:
+            messagebox.showwarning("Camera not initialized", "Initialize the corpus and MRI graph first, with webcam enabled.")
+            return
+        if self.camera.cap is None:
+            messagebox.showerror("Webcam unavailable", "Could not open webcam device 0. Check Windows camera permissions and close other apps using the camera.")
+            return
+        self.live_video = True
+        self._update_live_video()
+
+    def stop_live_video(self):
+        self.live_video = False
+        if self._live_after_id is not None:
+            try: self.root.after_cancel(self._live_after_id)
+            except tk.TclError: pass
+            self._live_after_id = None
+
+    def _update_live_video(self):
+        if not self.live_video or self.camera is None:
+            return
+        try:
+            frame = self.camera.capture()
+            objects = self.camera.last_objects
+            self._draw_live_hud(frame, objects)
+            self._live_after_id = self.root.after(35, self._update_live_video)
+        except Exception as exc:
+            self.stop_live_video()
+            self.status.config(text=f"Live camera error: {exc}", foreground="darkred")
+
+    def _draw_live_hud(self, frame, objects):
+        self.canvas.delete("all")
+        w, h = max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image = Image.fromarray(rgb).resize((w, h), Image.Resampling.BILINEAR)
+        self.tk_image = ImageTk.PhotoImage(image)
+        self.canvas.create_image(0, 0, image=self.tk_image, anchor="nw")
+        fh, fw = frame.shape[:2]
+        for obj in objects:
+            x1, y1, x2, y2 = obj["bbox"]
+            coords = (x1/max(fw, 1)*w, y1/max(fh, 1)*h, x2/max(fw, 1)*w, y2/max(fh, 1)*h)
+            color = "#00ff66" if obj["name"] != "untrained region" else "#ffcc33"
+            self.canvas.create_rectangle(*coords, outline=color, width=2)
+            label = f"{obj['name']} {obj['confidence']:.0%}"
+            self.canvas.create_text(coords[0]+3, max(8, coords[1]-8), text=label, fill=color, anchor="sw", font=("Arial", 8, "bold"))
+        self.canvas.create_rectangle(4, 4, w-4, h-4, outline="#00ffcc", width=2)
+        self.hud_text.config(text=f"LIVE WEBCAM · MRI graph nodes: {len(self.circuit.coords) if self.circuit else 0} · learned labels: {len(self.camera.memory)}")
+        self.recognized_text.delete("1.0", "end")
+        if objects:
+            for obj in objects:
+                self.recognized_text.insert("end", f"{obj['name']} ({obj['confidence']:.0%}) — {obj['source']}\n")
+        else:
+            self.recognized_text.insert("end", "No foreground regions yet. Keep the camera still briefly, then move the object.\n")
+
+    def teach_camera(self):
+        if self.camera is None:
+            messagebox.showwarning("Camera not initialized", "Initialize the corpus and MRI graph first.")
+            return
+        try:
+            label, bbox = self.camera.teach_largest_region(self.teach_label.get())
+            self.status.config(text=f"Learned label '{label}' from the largest live-camera region. Memory saved to visual_memory.json.", foreground="darkgreen")
+            messagebox.showinfo("Visual example learned", f"Label: {label}\nThe next similar camera region can be matched against this example.")
+        except Exception as exc:
+            messagebox.showerror("Could not learn example", str(exc))
+
+    def start_generation(self):
+        if self.model is None or self.vocab is None:
+            messagebox.showwarning("Not initialized", "Initialize the model on the Corpus & MRI tab first."); return
+        if self.worker is not None and self.worker.is_alive():
+            messagebox.showinfo("Working", "Generation is already running."); return
+        prompt = self.prompt.get().strip()
+        try: max_new = max(1, min(300, int(self.max_tokens.get())))
+        except (ValueError, tk.TclError): max_new = 40
+        model, vocab = self.model, self.vocab
+        self.output.delete("1.0", "end"); self.output.insert("end", "Generating…\n")
+        self.worker = threading.Thread(target=self._generation_worker, args=(model, vocab, prompt, max_new), daemon=True)
+        self.worker.start()
+
+    def _generation_worker(self, model, vocab, prompt, max_new):
+        try:
+            # Capture and recognize first so image-derived vocabulary can actually
+            # condition generation, rather than merely being printed afterward.
+            if self.camera is not None:
+                if self.live_video and self.camera.last_color is not None:
+                    frame = self.camera.last_color.copy()
+                    objects = list(self.camera.last_objects)
+                else:
+                    frame = self.camera.capture()
+                    objects = list(self.camera.last_objects)
+            else:
+                frame, objects = None, []
+            image_terms = [obj["name"] for obj in objects if obj["name"] != "untrained region" and obj["name"] in vocab.stoi]
+            image_terms = list(dict.fromkeys(image_terms))
+            effective_prompt = prompt
+            if image_terms:
+                effective_prompt = (prompt + " " + " ".join(image_terms)).strip()
+            text = generate(model, vocab, effective_prompt, max_new=max_new)
+            recognized_terms = list(dict.fromkeys(obj["name"] for obj in objects))
+            if recognized_terms:
+                text += "\n\nImage-recognized concepts: " + ", ".join(recognized_terms)
+            if image_terms:
+                text += "\nCorpus-vocabulary matches used as generation context: " + ", ".join(image_terms)
+            self.messages.put(("ok", prompt, text, frame, objects))
+        except Exception as exc:
+            self.messages.put(("error", str(exc)))
+
+    def _poll_messages(self):
+        try:
+            while True:
+                item = self.messages.get_nowait()
+                if item[0] == "error":
+                    messagebox.showerror("Generation error", item[1]); continue
+                _, prompt, text, frame, objects = item
+                self.output.delete("1.0", "end")
+                self.output.insert("end", f"Prompt: {prompt}\n\nCompletion:\n{text}\n")
+                self._draw_hud(frame, objects, text)
+        except queue.Empty:
+            pass
+        if self.root.winfo_exists(): self.root.after(100, self._poll_messages)
+
+    def _draw_hud(self, frame, objects, text):
+        self.canvas.delete("all")
+        w, h = max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())
+        if isinstance(frame, np.ndarray) and frame.size:
+            display_frame = self.camera.last_color if self.camera is not None and self.camera.last_color is not None else np.uint8(np.clip(frame, 0, 1) * 255)
+            if display_frame.ndim == 3:
+                display_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+            image = Image.fromarray(display_frame).resize((w, h), Image.Resampling.BILINEAR)
+            self.tk_image = ImageTk.PhotoImage(image)
+            self.canvas.create_image(0, 0, image=self.tk_image, anchor="nw")
+            fh, fw = frame.shape[:2]
+            for obj in objects:
+                x, y = obj["pixel_pos"]
+                px, py = x / max(fw, 1) * w, y / max(fh, 1) * h
+                if "bbox" in obj:
+                    x1, y1, x2, y2 = obj["bbox"]
+                    coords = (x1/max(fw, 1)*w, y1/max(fh, 1)*h, x2/max(fw, 1)*w, y2/max(fh, 1)*h)
+                    color = "#00ff66" if obj["name"] != "untrained region" else "#ffcc33"
+                    self.canvas.create_rectangle(*coords, outline=color, width=2)
+                else:
+                    color = "#00ff66"
+                    self.canvas.create_rectangle(px-10, py-10, px+10, py+10, outline=color, width=2)
+                label_text = obj["name"] + (" ✓vocab" if obj.get("vocab_matches") else "")
+                self.canvas.create_text(px, max(10, py-17), text=label_text, fill=color, font=("Arial", 8, "bold"))
+        else:
+            self.canvas.create_text(w/2, h/2, text="Camera disabled", fill="white")
+        self.canvas.create_rectangle(4, 4, w-4, h-4, outline="#00ffcc", width=2)
+        short_text = text[:130] + ("…" if len(text) > 130 else "")
+        named_count = sum(1 for obj in objects if obj.get("name") != "untrained region")
+        self.hud_text.config(text=f"MRI graph: {len(self.circuit.coords) if self.circuit else 0} nodes\nLearned visual labels recognized: {named_count} · stored examples: {len(self.camera.memory) if self.camera else 0}\nGenerated context: {short_text}")
+        if hasattr(self, "recognized_text"):
+            self.recognized_text.delete("1.0", "end")
+            if objects:
+                for obj in objects:
+                    matches = ", ".join(obj.get("vocab_matches", [])) or "no corpus match"
+                    self.recognized_text.insert("end", f"[{obj['source']}] {obj['name']} ({obj['confidence']:.0%}) → {matches}\n")
+            else:
+                self.recognized_text.insert("end", "No taught labels matched. Teach examples using the live camera. This recognizer does not use downloaded model weights.\n")
+
+    def close(self):
+        self.stop_live_video()
+        if self.camera is not None: self.camera.close()
+        self.root.destroy()
+
+
+def main():
+    root = tk.Tk()
+    NeuralLLMApp(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()

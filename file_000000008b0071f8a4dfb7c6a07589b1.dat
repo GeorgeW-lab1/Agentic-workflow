@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "Smart Cookie Deleter - Text Mining",
+  "version": "2.0",
+  "description": "Delete cookies by analyzing page content and text patterns",
+  "permissions": [
+    "cookies",
+    "activeTab",
+    "scripting"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_end"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Smart Cookie Deleter"
+  },
+  "host_permissions": [
+    "<all_urls>"
+  ]
+}

@@ -1,0 +1,38 @@
+SiC gate-level phononic SHA-256 PoW simulation\n{
+  "experiment": "gate-level ideal Boolean SHA-256 with phonon-transport estimates",
+  "payload": "SiC phononic SHA-256 PoW",
+  "pow": {
+    "nonce": 33,
+    "digest": "0a96e2827c6f98bd2dc642d9682574ad85f27c4384fe945892a5bd6431ca8802",
+    "difficulty_hex_zeros": 1,
+    "attempts": 34,
+    "elapsed_seconds": 1.1434758350000038,
+    "verified_by_internal_sha256": true
+  },
+  "phonon_fabric": {
+    "temperature_K": 300.0,
+    "path_length_m": 2e-06,
+    "effective_mean_free_path_m": 3e-07,
+    "attenuation_exp_minus_L_over_MFP": 0.0012726338013398079,
+    "gate_energy_J": 2.0000000000000002e-20,
+    "gate_error_probability_estimate": 0.49888435587476365,
+    "estimated_probability_at_least_one_gate_error": 1.0,
+    "logical_gate_count": 4378112,
+    "gate_counts": {
+      "XOR": 1793024,
+      "AND": 1653760,
+      "OR": 861696,
+      "NOT": 69632
+    },
+    "estimated_total_gate_energy_J": 8.756223999790113e-14,
+    "estimated_total_gate_energy_pJ": 0.08756223999790114,
+    "serial_path_delay_lower_bound_s": 0.000972913777695222,
+    "caveat": "Illustrative threshold-margin/noise model, not calibrated SiC data; exact digest is produced by ideal Boolean gate outputs."
+  },
+  "limitations": [
+    "No hashlib or external SHA-256 implementation is used for the mining computation.",
+    "The SHA-256 Boolean network is evaluated in software; it is not physically computed by phonons.",
+    "Transport is represented by attenuation, path delay, and an illustrative thermal error estimate, not a numerical solution of the phonon Boltzmann equation.",
+    "The SHA digest must be independently checked with a trusted implementation before cryptographic use."
+  ]
+}

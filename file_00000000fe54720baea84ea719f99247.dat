@@ -1,0 +1,142 @@
+
+# Monge–Ampère Refactor of NOCN
+# Replaces:
+#   Partition Routing
+#   Object Routing
+#   Sparse Expert Mixture
+# with:
+#   Convex Potential Network
+#   Optimal Transport Latent Map T(x)=∇φ(x)
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class TransportPotential(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d, d),
+            nn.SiLU(),
+            nn.Linear(d, d),
+            nn.SiLU(),
+            nn.Linear(d, 1),
+        )
+
+    def forward(self, x):
+        x = x.requires_grad_(True)
+        phi = self.net(x).sum()
+        grad = torch.autograd.grad(
+            phi, x,
+            create_graph=True,
+            retain_graph=True
+        )[0]
+        return grad
+
+class MongeAmpereNOCN(nn.Module):
+    def __init__(self, vocab_size, cfg):
+        super().__init__()
+
+        self.cfg = cfg
+
+        self.word_emb = nn.Embedding(vocab_size, cfg.d_model)
+        self.pos_emb = nn.Embedding(cfg.seq_len - 1, cfg.d_model)
+
+        self.coeff_encoder = nn.Sequential(
+            nn.Linear(cfg.d_model, cfg.d_coef),
+            nn.Tanh(),
+            nn.Linear(cfg.d_coef, cfg.d_coef)
+        )
+
+        self.temporal_ode = nn.Sequential(
+            nn.Linear(cfg.d_model + cfg.d_coef, cfg.d_obj),
+            nn.SiLU(),
+            nn.Linear(cfg.d_obj, cfg.d_obj)
+        )
+
+        self.transport = TransportPotential(cfg.d_obj)
+
+        self.mem_project = nn.Linear(cfg.d_mem, cfg.d_obj)
+
+        self.reconstructor = nn.Sequential(
+            nn.Linear(cfg.d_obj * 2, cfg.d_obj),
+            nn.GELU(),
+            nn.Linear(cfg.d_obj, vocab_size)
+        )
+
+        self.contrast_proj = nn.Linear(cfg.d_obj, cfg.d_obj)
+
+    def encode_context(self, x):
+        B, T = x.shape
+        pos = torch.arange(T, device=x.device)
+
+        h = self.word_emb(x) + self.pos_emb(pos)[None]
+        h = h.mean(dim=1)
+
+        c = self.coeff_encoder(h)
+        return h, c
+
+    def temporal_dynamics(self, h, c):
+        z = torch.cat([h, c], dim=-1)
+        dz = self.temporal_ode(z)
+        return h + self.cfg.temp_step * dz
+
+    def forward(self, x, memory_read):
+        h, c = self.encode_context(x)
+
+        obj_state = self.temporal_dynamics(h, c)
+
+        transported = self.transport(obj_state)
+
+        mem = self.mem_project(memory_read)
+
+        fused = torch.cat([transported, mem], dim=-1)
+
+        logits = self.reconstructor(fused)
+
+        return {
+            "logits": logits,
+            "transported": transported,
+            "obj_state": obj_state,
+            "h": h,
+            "c": c
+        }
+
+    def monge_ampere_loss(self, transported):
+        density = torch.softmax(
+            transported.norm(dim=-1),
+            dim=0
+        )
+
+        target = torch.ones_like(density) / density.numel()
+
+        return F.mse_loss(density, target)
+
+    def loss_fn(self, out, y):
+        recon = F.cross_entropy(out["logits"], y)
+
+        transport = self.monge_ampere_loss(
+            out["transported"]
+        )
+
+        z = F.normalize(
+            self.contrast_proj(out["transported"]),
+            dim=-1
+        )
+
+        sim = z @ z.t()
+
+        eye = torch.eye(
+            sim.size(0),
+            device=sim.device
+        )
+
+        contrast = ((sim - eye) ** 2).mean()
+
+        total = (
+            recon +
+            0.2 * contrast +
+            0.1 * transport
+        )
+
+        return total

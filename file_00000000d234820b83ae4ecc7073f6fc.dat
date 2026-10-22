@@ -1,0 +1,582 @@
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <numeric>
+#include <random>
+#include <vector>
+
+struct Result {
+    double success_probability;
+    double expected_trials;
+};
+
+class Exp1RNG {
+public:
+    explicit Exp1RNG(uint64_t seed = 123456789ULL)
+        : rng(seed), uniform(0.0, 1.0) {}
+
+    double exp1() {
+        double u;
+
+        // Avoid exactly 0 or 1.
+        do {
+            u = uniform(rng);
+        } while (u <= 0.0 || u >= 1.0);
+
+        return -std::log(u);
+    }
+
+private:
+    std::mt19937_64 rng;
+    std::uniform_real_distribution<double> uniform;
+};
+
+
+// ------------------------------------------------------------
+// 1. IID Exp(1)
+// ------------------------------------------------------------
+//
+// X_1,...,X_n are independent Exp(1).
+//
+// S = X_1 + ... + X_n
+//
+// S ~ Gamma(n,1)
+// ------------------------------------------------------------
+
+Result iid_exp1(
+    std::size_t n,
+    double threshold,
+    uint64_t trials,
+    uint64_t seed)
+{
+    Exp1RNG rng(seed);
+
+    uint64_t successes = 0;
+
+    for (uint64_t t = 0; t < trials; ++t) {
+        double sum = 0.0;
+
+        for (std::size_t i = 0; i < n; ++i) {
+            sum += rng.exp1();
+        }
+
+        if (sum >= threshold) {
+            ++successes;
+        }
+    }
+
+    double p =
+        static_cast<double>(successes) /
+        static_cast<double>(trials);
+
+    double expected =
+        p > 0.0
+        ? 1.0 / p
+        : std::numeric_limits<double>::infinity();
+
+    return {p, expected};
+}
+
+
+// ------------------------------------------------------------
+// 2. Fully correlated coordinates
+// ------------------------------------------------------------
+//
+// X_1 = X_2 = ... = X_n = X
+//
+// Therefore:
+//
+// S = nX
+//
+// P(S >= T) = exp(-T/n)
+//
+// This is NOT normally a valid PoW shortcut unless the protocol
+// permits the miner to construct coordinates from the same
+// underlying entropy.
+// ------------------------------------------------------------
+
+Result correlated_exp1(
+    std::size_t n,
+    double threshold,
+    uint64_t trials,
+    uint64_t seed)
+{
+    Exp1RNG rng(seed);
+
+    uint64_t successes = 0;
+
+    for (uint64_t t = 0; t < trials; ++t) {
+        const double x = rng.exp1();
+        const double sum = static_cast<double>(n) * x;
+
+        if (sum >= threshold) {
+            ++successes;
+        }
+    }
+
+    double p =
+        static_cast<double>(successes) /
+        static_cast<double>(trials);
+
+    double expected =
+        p > 0.0
+        ? 1.0 / p
+        : std::numeric_limits<double>::infinity();
+
+    return {p, expected};
+}
+
+
+// ------------------------------------------------------------
+// 3. Maximum selection
+// ------------------------------------------------------------
+//
+// Generate n independent Exp(1) values:
+//
+// M = max(X_1,...,X_n)
+//
+// Accept if M >= threshold.
+//
+// Exact probability:
+//
+// P(M >= T)
+//   = 1 - (1-exp(-T))^n
+// ------------------------------------------------------------
+
+Result maximum_selection(
+    std::size_t n,
+    double threshold,
+    uint64_t trials,
+    uint64_t seed)
+{
+    Exp1RNG rng(seed);
+
+    uint64_t successes = 0;
+
+    for (uint64_t t = 0; t < trials; ++t) {
+        double maximum = 0.0;
+
+        for (std::size_t i = 0; i < n; ++i) {
+            maximum = std::max(maximum, rng.exp1());
+        }
+
+        if (maximum >= threshold) {
+            ++successes;
+        }
+    }
+
+    double p =
+        static_cast<double>(successes) /
+        static_cast<double>(trials);
+
+    double expected =
+        p > 0.0
+        ? 1.0 / p
+        : std::numeric_limits<double>::infinity();
+
+    return {p, expected};
+}
+
+
+// ------------------------------------------------------------
+// 4. Adaptive best-subset selection
+// ------------------------------------------------------------
+//
+// Generate m independent Exp(1) values.
+//
+// Select the largest k coordinates.
+//
+// Accept if:
+//
+// X_(m-k+1) + ... + X_(m) >= threshold
+//
+// This models a protocol in which the miner can observe a larger
+// candidate pool and choose favorable coordinates afterward.
+//
+// IMPORTANT:
+//
+// This is only an actual PoW reduction if the protocol permits
+// this selection without charging the miner for all m candidates.
+// ------------------------------------------------------------
+
+Result adaptive_best_subset(
+    std::size_t m,
+    std::size_t k,
+    double threshold,
+    uint64_t trials,
+    uint64_t seed)
+{
+    if (k > m || k == 0) {
+        return {0.0, std::numeric_limits<double>::infinity()};
+    }
+
+    Exp1RNG rng(seed);
+
+    uint64_t successes = 0;
+
+    std::vector<double> values(m);
+
+    for (uint64_t t = 0; t < trials; ++t) {
+
+        for (std::size_t i = 0; i < m; ++i) {
+            values[i] = rng.exp1();
+        }
+
+        // Put largest values first.
+        std::partial_sort(
+            values.begin(),
+            values.begin() + static_cast<std::ptrdiff_t>(k),
+            values.end(),
+            std::greater<double>()
+        );
+
+        double sum = 0.0;
+
+        for (std::size_t i = 0; i < k; ++i) {
+            sum += values[i];
+        }
+
+        if (sum >= threshold) {
+            ++successes;
+        }
+    }
+
+    double p =
+        static_cast<double>(successes) /
+        static_cast<double>(trials);
+
+    double expected =
+        p > 0.0
+        ? 1.0 / p
+        : std::numeric_limits<double>::infinity();
+
+    return {p, expected};
+}
+
+
+// ------------------------------------------------------------
+// Exact theoretical probabilities
+// ------------------------------------------------------------
+
+double theoretical_correlated(
+    std::size_t n,
+    double threshold)
+{
+    return std::exp(
+        -threshold / static_cast<double>(n)
+    );
+}
+
+
+double theoretical_maximum(
+    std::size_t n,
+    double threshold)
+{
+    const double e = std::exp(-threshold);
+
+    // More numerically stable than:
+    // 1 - pow(1-e,n)
+    return -std::expm1(
+        static_cast<double>(n) *
+        std::log1p(-e)
+    );
+}
+
+
+// Gamma survival probability for integer shape n:
+//
+// P(Gamma(n,1) >= T)
+// = exp(-T) * sum_{k=0}^{n-1} T^k/k!
+// ------------------------------------------------------------
+
+double theoretical_iid(
+    std::size_t n,
+    double threshold)
+{
+    double term = 1.0;
+    double sum = 1.0;
+
+    for (std::size_t k = 1; k < n; ++k) {
+        term *= threshold /
+                static_cast<double>(k);
+
+        sum += term;
+    }
+
+    return std::exp(-threshold) * sum;
+}
+
+
+// ------------------------------------------------------------
+// Printing
+// ------------------------------------------------------------
+
+void print_result(
+    const std::string& name,
+    const Result& r,
+    double theoretical)
+{
+    std::cout << std::left
+              << std::setw(32)
+              << name
+
+              << std::setw(18)
+              << std::scientific
+              << r.success_probability
+
+              << std::setw(18)
+              << r.expected_trials
+
+              << std::setw(18)
+              << theoretical
+
+              << "\n";
+}
+
+
+// ------------------------------------------------------------
+// Main
+// ------------------------------------------------------------
+
+int main()
+{
+    // --------------------------------------------------------
+    // Parameters
+    // --------------------------------------------------------
+
+    const std::size_t n = 4;
+
+    // Threshold for the sum.
+    const double threshold = 20.0;
+
+    // Number of Monte-Carlo experiments.
+    //
+    // Increase this substantially for more accurate estimates.
+    const uint64_t trials = 5'000'000ULL;
+
+    const uint64_t seed = 0x123456789ABCDEF0ULL;
+
+    // Adaptive selection:
+    //
+    // Generate M coordinates and select the largest K.
+    const std::size_t adaptive_m = 32;
+    const std::size_t adaptive_k = 4;
+
+
+    std::cout << "\n";
+    std::cout << "===============================================\n";
+    std::cout << " Exp(1) Volumetric PoW Bias Simulator\n";
+    std::cout << "===============================================\n\n";
+
+    std::cout << "n                  = " << n << "\n";
+    std::cout << "threshold          = " << threshold << "\n";
+    std::cout << "Monte Carlo trials = " << trials << "\n";
+    std::cout << "\n";
+
+    std::cout
+        << std::left
+        << std::setw(32)
+        << "Construction"
+        << std::setw(18)
+        << "Empirical P"
+        << std::setw(18)
+        << "Empirical Work"
+        << std::setw(18)
+        << "Theory"
+        << "\n";
+
+    std::cout
+        << std::string(86, '-')
+        << "\n";
+
+
+    // --------------------------------------------------------
+    // IID baseline
+    // --------------------------------------------------------
+
+    Result iid =
+        iid_exp1(
+            n,
+            threshold,
+            trials,
+            seed + 1
+        );
+
+    print_result(
+        "IID Exp(1)",
+        iid,
+        theoretical_iid(n, threshold)
+    );
+
+
+    // --------------------------------------------------------
+    // Full correlation
+    // --------------------------------------------------------
+
+    Result correlated =
+        correlated_exp1(
+            n,
+            threshold,
+            trials,
+            seed + 2
+        );
+
+    print_result(
+        "Fully correlated",
+        correlated,
+        theoretical_correlated(n, threshold)
+    );
+
+
+    // --------------------------------------------------------
+    // Maximum selection
+    // --------------------------------------------------------
+
+    Result maximum =
+        maximum_selection(
+            n,
+            threshold,
+            trials,
+            seed + 3
+        );
+
+    print_result(
+        "Maximum of n coordinates",
+        maximum,
+        theoretical_maximum(n, threshold)
+    );
+
+
+    // --------------------------------------------------------
+    // Adaptive subset selection
+    // --------------------------------------------------------
+
+    Result adaptive =
+        adaptive_best_subset(
+            adaptive_m,
+            adaptive_k,
+            threshold,
+            trials,
+            seed + 4
+        );
+
+    print_result(
+        "Adaptive best subset",
+        adaptive,
+        std::numeric_limits<double>::quiet_NaN()
+    );
+
+
+    // --------------------------------------------------------
+    // Relative work
+    // --------------------------------------------------------
+
+    std::cout << "\n";
+    std::cout << "===============================================\n";
+    std::cout << " Relative Work\n";
+    std::cout << "===============================================\n\n";
+
+    if (iid.success_probability > 0.0) {
+
+        std::cout
+            << "Correlated / IID work ratio: "
+            << correlated.expected_trials /
+               iid.expected_trials
+            << "\n";
+
+        std::cout
+            << "Maximum / IID work ratio:    "
+            << maximum.expected_trials /
+               iid.expected_trials
+            << "\n";
+
+        std::cout
+            << "Adaptive / IID work ratio:   "
+            << adaptive.expected_trials /
+               iid.expected_trials
+            << "\n";
+    }
+
+
+    // --------------------------------------------------------
+    // Exact values
+    // --------------------------------------------------------
+
+    std::cout << "\n";
+    std::cout << "===============================================\n";
+    std::cout << " Exact Reference Probabilities\n";
+    std::cout << "===============================================\n\n";
+
+    const double p_iid =
+        theoretical_iid(n, threshold);
+
+    const double p_corr =
+        theoretical_correlated(n, threshold);
+
+    const double p_max =
+        theoretical_maximum(n, threshold);
+
+    std::cout
+        << "IID Gamma tail:       "
+        << std::scientific
+        << p_iid
+        << "\n";
+
+    std::cout
+        << "Fully correlated:     "
+        << p_corr
+        << "\n";
+
+    std::cout
+        << "Maximum selection:    "
+        << p_max
+        << "\n";
+
+    std::cout << "\n";
+
+    std::cout
+        << "Expected IID work:    "
+        << 1.0 / p_iid
+        << "\n";
+
+    std::cout
+        << "Expected correlated:  "
+        << 1.0 / p_corr
+        << "\n";
+
+    std::cout
+        << "Expected max work:    "
+        << 1.0 / p_max
+        << "\n";
+
+
+    // --------------------------------------------------------
+    // Protocol warning
+    // --------------------------------------------------------
+
+    std::cout << "\n";
+    std::cout << "===============================================\n";
+    std::cout << " Interpretation\n";
+    std::cout << "===============================================\n\n";
+
+    std::cout
+        << "Correlation is only a real PoW shortcut if the verifier\n"
+        << "allows the miner to create correlated coordinates while\n"
+        << "the difficulty calculation assumes independent ones.\n\n";
+
+    std::cout
+        << "Likewise, adaptive selection only reduces effective work\n"
+        << "if the miner receives multiple candidate coordinates but\n"
+        << "the protocol charges difficulty as though there were only\n"
+        << "one candidate.\n\n";
+
+    std::cout
+        << "If every candidate requires an independent cryptographic\n"
+        << "hash evaluation, the additional candidate volume itself\n"
+        << "has to be counted as work.\n\n";
+
+    return 0;
+}

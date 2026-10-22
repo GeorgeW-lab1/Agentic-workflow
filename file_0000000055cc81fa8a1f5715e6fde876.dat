@@ -1,0 +1,285 @@
+// factor_boost_512.cu
+// 512-bit (8 x uint64_t) CUDA Pollard-Rho factorisation with Montgomery arithmetic.
+// Host-side Boost.Multiprecision is used for parsing, recursive factorisation and exact verification.
+// CUDA searches factors of composite values up to 512 bits in parallel.
+
+#if defined(__CUDACC__)
+#define _AMXTILEINTRIN_H_INCLUDED
+#define _AMXINT8INTRIN_H_INCLUDED
+#define _AMXBF16INTRIN_H_INCLUDED
+#define _AMXFP16INTRIN_H_INCLUDED
+#define _AMXCOMPLEXINTRIN_H_INCLUDED
+#define _AMXTF32INTRIN_H_INCLUDED
+#define _AMXFP8INTRIN_H_INCLUDED
+#define _AMXAVX512INTRIN_H_INCLUDED
+#define _AMXTRANSPOSEINTRIN_H_INCLUDED
+#define _AMXMOVRSINTRIN_H_INCLUDED
+#define _AMXMOVRSTRANSPOSEINTRIN_H_INCLUDED
+#endif
+
+#include <cuda_runtime.h>
+#include <boost/multiprecision/cpp_int.hpp>
+#ifdef __CUDACC__
+#define BOOST_DISABLE_ASSERTS
+#define BOOST_NO_CXX11_HDR_ARRAY
+#define BOOST_NO_CXX11_HDR_ATOMIC
+#define BOOST_NO_CXX11_HDR_TUPLE
+#endif
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <exception>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <random>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+using boost::multiprecision::cpp_int;
+
+#define CUDA_CHECK(call) do { cudaError_t e__=(call); if(e__!=cudaSuccess){ std::ostringstream s__; s__<<"CUDA error at "<<__FILE__<<":"<<__LINE__<<": "<<cudaGetErrorString(e__); throw std::runtime_error(s__.str()); } } while(false)
+
+constexpr int LIMBS = 8;
+constexpr int CUDA_BLOCKS = 256;
+constexpr int CUDA_THREADS = 256;
+constexpr int CUDA_WALKS = CUDA_BLOCKS * CUDA_THREADS;
+constexpr int CUDA_STEPS = 4096;
+constexpr int CUDA_RESTARTS = 128;
+
+struct U512 { uint64_t v[LIMBS]; };
+
+struct U1024 { uint64_t v[17]; };
+
+__device__ __forceinline__ uint64_t adc64(uint64_t a,uint64_t b,uint64_t c,uint64_t* carry){
+    uint64_t s=a+b; uint64_t c1=(s<a); uint64_t t=s+c; uint64_t c2=(t<s); *carry=c1|c2; return t;
+}
+
+__device__ __forceinline__ uint64_t subborrow64(uint64_t a,uint64_t b,uint64_t borrow,uint64_t* outborrow){
+    uint64_t d=a-b; uint64_t b1=(a<b); uint64_t d2=d-borrow; uint64_t b2=(d<borrow); *outborrow=b1|b2; return d2;
+}
+
+__device__ bool u512_zero(const U512&a){ for(int i=0;i<LIMBS;i++) if(a.v[i]) return false; return true; }
+__device__ bool u512_eq(const U512&a,const U512&b){ for(int i=LIMBS-1;i>=0;i--) if(a.v[i]!=b.v[i]) return false; return true; }
+__device__ bool u512_ge(const U512&a,const U512&b){ for(int i=LIMBS-1;i>=0;i--){ if(a.v[i]!=b.v[i]) return a.v[i]>b.v[i]; } return true; }
+
+__device__ U512 u512_sub(const U512&a,const U512&b){ U512 r; uint64_t br=0; for(int i=0;i<LIMBS;i++) r.v[i]=subborrow64(a.v[i],b.v[i],br,&br); return r; }
+
+__device__ U512 u512_add_mod(const U512&a,const U512&b,const U512&n){
+    U512 r; uint64_t carry=0;
+    for(int i=0;i<LIMBS;i++) r.v[i]=adc64(a.v[i],b.v[i],carry,&carry);
+    if(carry || u512_ge(r,n)) r=u512_sub(r,n);
+    return r;
+}
+
+__device__ U512 u512_double_mod(const U512&a,const U512&n){ return u512_add_mod(a,a,n); }
+
+__device__ uint64_t mul_lo(uint64_t a,uint64_t b){ return a*b; }
+__device__ uint64_t mul_hi(uint64_t a,uint64_t b){ return __umul64hi(a,b); }
+
+// Montgomery multiplication using 8x8 schoolbook multiplication followed by REDC.
+// Inputs and output are in Montgomery form: xR mod n.
+__device__ U512 mont_mul(const U512&a,const U512&b,const U512&n,uint64_t n0inv){
+    U1024 t{};
+    for(int i=0;i<LIMBS;i++){
+        uint64_t carry=0;
+        for(int j=0;j<LIMBS;j++){
+            uint64_t hi=mul_hi(a.v[i],b.v[j]);
+            uint64_t lo=mul_lo(a.v[i],b.v[j]);
+            uint64_t c1=0,c2=0;
+            uint64_t s=adc64(t.v[i+j],lo,0,&c1);
+            s=adc64(s,carry,0,&c2);
+            t.v[i+j]=s;
+            uint64_t cc=0;
+            uint64_t nc=hi+c1;
+            cc |= (nc<hi);
+            uint64_t nc2=nc+c2;
+            cc |= (nc2<nc);
+            carry=nc2;
+        }
+        int k=i+LIMBS;
+        uint64_t c=0;
+        t.v[k]=adc64(t.v[k],carry,0,&c);
+        for(k++;k<17 && c;k++) t.v[k]=adc64(t.v[k],0,c,&c);
+    }
+    for(int i=0;i<LIMBS;i++){
+        uint64_t m=t.v[i]*n0inv;
+        uint64_t carry=0;
+        for(int j=0;j<LIMBS;j++){
+            uint64_t hi=mul_hi(m,n.v[j]);
+            uint64_t lo=mul_lo(m,n.v[j]);
+            uint64_t c1=0,c2=0;
+            uint64_t s=adc64(t.v[i+j],lo,0,&c1);
+            s=adc64(s,carry,0,&c2);
+            t.v[i+j]=s;
+            uint64_t cc=0;
+            uint64_t nc=hi+c1;
+            cc |= (nc<hi);
+            uint64_t nc2=nc+c2;
+            cc |= (nc2<nc);
+            carry=nc2;
+        }
+        int k=i+LIMBS;
+        uint64_t c=0;
+        t.v[k]=adc64(t.v[k],carry,0,&c);
+        for(k++;k<17 && c;k++) t.v[k]=adc64(t.v[k],0,c,&c);
+    }
+    U512 r;
+    for(int i=0;i<LIMBS;i++) r.v[i]=t.v[i+LIMBS];
+    if(u512_ge(r,n)) r=u512_sub(r,n);
+    return r;
+}
+
+__device__ U512 mont_square(const U512&a,const U512&n,uint64_t inv){ return mont_mul(a,a,n,inv); }
+
+__device__ U512 mont_pow(U512 base,U512 exp,const U512&n,uint64_t inv,U512 oneR){
+    U512 r=oneR;
+    for(int i=LIMBS-1;i>=0;i--){
+        for(int bit=63;bit>=0;bit--){
+            r=mont_square(r,n,inv);
+            if((exp.v[i]>>bit)&1ULL) r=mont_mul(r,base,n,inv);
+        }
+    }
+    return r;
+}
+
+__device__ uint64_t gcd64(uint64_t a,uint64_t b){ while(b){uint64_t r=a%b;a=b;b=r;} return a; }
+
+// Binary GCD for 512-bit values. This is deliberately simple and entirely integer based.
+__device__ U512 u512_shr1(U512 a){
+    for(int i=0;i<LIMBS-1;i++) a.v[i]=(a.v[i]>>1)|(a.v[i+1]<<63);
+    a.v[LIMBS-1]>>=1; return a;
+}
+__device__ int u512_ctz(const U512&a){ for(int i=0;i<LIMBS;i++) if(a.v[i]) return i*64+__ffsll((long long)a.v[i])-1; return 512; }
+__device__ U512 gcd512(U512 a,U512 b){
+    if(u512_zero(a)) return b; if(u512_zero(b)) return a;
+    int za=u512_ctz(a),zb=u512_ctz(b); int shift=za<zb?za:zb;
+    for(int i=0;i<za;i++) a=u512_shr1(a); for(int i=0;i<zb;i++) b=u512_shr1(b);
+    while(!u512_eq(a,b)){
+        if(u512_ge(a,b)) a=u512_sub(a,b); else b=u512_sub(b,a);
+        if(!u512_zero(a)){int z=u512_ctz(a); for(int i=0;i<z;i++) a=u512_shr1(a);} 
+    }
+    for(int i=0;i<shift;i++){
+        // Saturating left shift by one; gcd is only used as a divisor and inputs are < 2^512.
+        uint64_t carry=0; for(int j=0;j<LIMBS;j++){uint64_t nc=a.v[j]>>63;a.v[j]=(a.v[j]<<1)|carry;carry=nc;}
+    }
+    return a;
+}
+
+__device__ uint64_t splitmix64(uint64_t&x){
+    x+=0x9E3779B97F4A7C15ULL; uint64_t z=x;
+    z=(z^(z>>30))*0xBF58476D1CE4E5B9ULL;
+    z=(z^(z>>27))*0x94D049BB133111EBULL;
+    return z^(z>>31);
+}
+
+__device__ U512 random_below(uint64_t&state,const U512&n,int bits){
+    U512 r;
+    for(;;){
+        for(int i=0;i<LIMBS;i++) r.v[i]=splitmix64(state);
+        if(bits<512){int top=bits&63; if(top) r.v[LIMBS-1]&=((1ULL<<top)-1ULL); for(int i=(bits+63)/64;i<LIMBS;i++) r.v[i]=0;}
+        if(!u512_zero(r) && !u512_ge(r,n)) return r;
+    }
+}
+
+__device__ U512 rho_step(U512 x,const U512&c,const U512&n,uint64_t inv){
+    return u512_add_mod(mont_square(x,n,inv),c,n);
+}
+
+__global__ void pollard512_kernel(U512 n,U512 c_mont,U512 oneR,U512 r2R,uint64_t inv,int bits,int steps,uint64_t seed,U512*result){
+    uint64_t tid=(uint64_t)blockIdx.x*blockDim.x+threadIdx.x;
+    uint64_t state=seed^(tid*0x9E3779B97F4A7C15ULL);
+    U512 zero{};
+    if(u512_zero(n)) return;
+    if((n.v[0]&1ULL)==0ULL){ if(tid==0) result[0].v[0]=2; return; }
+    U512 c=random_below(state,n,bits); c=mont_mul(c,r2R,n,inv);
+    U512 x=random_below(state,n,bits); x=mont_mul(x,r2R,n,inv);
+    U512 y=x;
+    for(int it=0;it<steps;it++){
+        if(!u512_zero(result[0])) return;
+        x=rho_step(x,c,n,inv);
+        y=rho_step(y,c,n,inv); y=rho_step(y,c,n,inv);
+        U512 d; // |x-y| in Montgomery form; subtracting representations preserves the difference mod n.
+        if(u512_ge(x,y)) d=u512_sub(x,y); else d=u512_sub(y,x);
+        // Convert d from Montgomery representation by multiplying by ordinary 1.
+        U512 ordinary_one{}; ordinary_one.v[0]=1;
+        d=mont_mul(d,ordinary_one,n,inv);
+        U512 g=gcd512(d,n);
+        U512 one{}; one.v[0]=1;
+        if(u512_ge(g,one) && !u512_eq(g,n) && !u512_zero(g)){ result[0]=g; return; }
+    }
+}
+
+uint64_t mont_n0inv(uint64_t n0){
+    uint64_t x=1;
+    for(int i=0;i<6;i++) x*=2-n0*x;
+    return ~x+1;
+}
+
+cpp_int u512_to_cpp(const U512&x){ cpp_int r=0; for(int i=LIMBS-1;i>=0;i--){r<<=64;r+=x.v[i];} return r; }
+U512 cpp_to_u512(const cpp_int&x){ U512 r{}; cpp_int t=x; const cpp_int mask=(cpp_int(1)<<64)-1; for(int i=0;i<LIMBS;i++){r.v[i]=(t&mask).convert_to<uint64_t>(); t>>=64;} return r;}
+
+bool u512_ge_host(const U512&a,const U512&b);
+U512 host_sub(const U512&a,const U512&b);
+U512 host_add_mod(U512 a,U512 b,const U512&n){
+    unsigned __int128 carry=0; U512 r{};
+    for(int i=0;i<LIMBS;i++){unsigned __int128 s=(unsigned __int128)a.v[i]+b.v[i]+carry;r.v[i]=(uint64_t)s;carry=s>>64;}
+    if(carry || u512_ge_host(r,n)) r=host_sub(r,n); return r;
+}
+// Host versions of compare/subtract.
+bool u512_ge_host(const U512&a,const U512&b){for(int i=LIMBS-1;i>=0;i--)if(a.v[i]!=b.v[i])return a.v[i]>b.v[i];return true;}
+U512 host_sub(const U512&a,const U512&b){U512 r{};unsigned __int128 br=0;for(int i=0;i<LIMBS;i++){unsigned __int128 aa=a.v[i];unsigned __int128 bb=(unsigned __int128)b.v[i]+br;r.v[i]=(uint64_t)(aa-bb);br=(aa<bb);}return r;}
+
+cpp_int powmod_cpp(cpp_int a,cpp_int e,const cpp_int&n){cpp_int r=1;a%=n;while(e){if((e&1)!=0)r=r*a%n;a=a*a%n;e>>=1;}return r;}
+std::mt19937_64 rng(std::random_device{}());
+cpp_int gcd_cpp(cpp_int a,cpp_int b){while(b){cpp_int r=a%b;a=b;b=r;}return a;}
+std::vector<uint64_t> small_primes={2,3,5,7,11,13,17,19,23,29,31,37,41,43,47,53};
+std::vector<uint64_t> mr_bases={2,3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,325,9375,450775,1795265022};
+bool probable_prime(const cpp_int&n){if(n<2)return false;for(auto p:small_primes){if(n==p)return true;if(n%p==0)return false;}cpp_int d=n-1;unsigned s=0;while((d&1)==0){d>>=1;++s;}for(auto base:mr_bases){cpp_int a=base%n;if(a==0)continue;cpp_int x=powmod_cpp(a,d,n);if(x==1||x==n-1)continue;bool w=true;for(unsigned r=1;r<s;r++){x=x*x%n;if(x==n-1){w=false;break;}}if(w)return false;}return true;}
+
+class Cuda512Finder{
+public:
+    Cuda512Finder(){CUDA_CHECK(cudaMalloc(&d_result_,sizeof(U512)));CUDA_CHECK(cudaMalloc(&d_n_,sizeof(U512)));CUDA_CHECK(cudaMalloc(&d_c_,sizeof(U512)));}
+    ~Cuda512Finder(){cudaFree(d_result_);cudaFree(d_n_);cudaFree(d_c_);}
+    cpp_int find_factor(const cpp_int&n){
+        if(n<=1)return 0; if((n&1)==0)return 2; if(n>=(cpp_int(1)<<512))return 0;
+        U512 hn=cpp_to_u512(n); int bits=boost::multiprecision::msb(n)+1;
+        if(bits>512)return 0;
+        uint64_t inv=mont_n0inv(hn.v[0]);
+        cpp_int R=(cpp_int(1)<<512)%n; cpp_int R2=(R*R)%n;
+        U512 oneR=cpp_to_u512(R), r2=cpp_to_u512(R2);
+        CUDA_CHECK(cudaMemcpy(d_n_,&hn,sizeof(hn),cudaMemcpyHostToDevice));
+        for(int restart=0;restart<CUDA_RESTARTS;restart++){
+            U512 zero{};CUDA_CHECK(cudaMemcpy(d_result_,&zero,sizeof(zero),cudaMemcpyHostToDevice));
+            uint64_t seed=(uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count()^(uint64_t)restart;
+            pollard512_kernel<<<CUDA_BLOCKS,CUDA_THREADS>>>(hn,zero,oneR,r2,inv,bits,CUDA_STEPS,seed,d_result_);
+            CUDA_CHECK(cudaGetLastError());CUDA_CHECK(cudaDeviceSynchronize());
+            U512 out{};CUDA_CHECK(cudaMemcpy(&out,d_result_,sizeof(out),cudaMemcpyDeviceToHost));
+            cpp_int f=u512_to_cpp(out);
+            if(f>1 && f<n && n%f==0)return f;
+        }
+        return 0;
+    }
+private: U512* d_result_{};U512* d_n_{};U512* d_c_{};
+};
+
+cpp_int pollard_cpu(const cpp_int&n){
+    if(n%2==0)return 2;if(n%3==0)return 3;if(n%5==0)return 5;
+    for(;;){cpp_int c=(cpp_int(rng())<<64)^rng();c%=n-1;c+=1;cpp_int x=(cpp_int(rng())<<64)^rng();x%=n;x+=1;cpp_int y=x;for(int i=0;i<200000;i++){x=(x*x+c)%n;y=(y*y+c)%n;y=(y*y+c)%n;cpp_int d=gcd_cpp(x>=y?x-y:y-x,n);if(d>1&&d<n)return d;if(d==n)break;}}
+}
+
+void factor_rec(const cpp_int&n,std::vector<cpp_int>&out,Cuda512Finder&cuda){
+    if(n<2)return;if(probable_prime(n)){out.push_back(n);return;}
+    cpp_int d=0;if(n<(cpp_int(1)<<512))d=cuda.find_factor(n);if(d<=1||d>=n||n%d!=0)d=pollard_cpu(n);if(d<=1||d>=n||n%d!=0)throw std::runtime_error("Pollard-Rho failed to produce a valid divisor");factor_rec(d,out,cuda);factor_rec(n/d,out,cuda);
+}
+
+std::vector<cpp_int> factor_complete(const cpp_int&n,Cuda512Finder&cuda){std::vector<cpp_int> f;factor_rec(n,f,cuda);std::sort(f.begin(),f.end());return f;}
+bool verify(const cpp_int&n,const std::vector<cpp_int>&f){cpp_int p=1;for(auto&x:f){if(!probable_prime(x))return false;p*=x;}return p==n;}
+std::string fmt(const std::vector<cpp_int>&f){std::ostringstream s;for(size_t i=0;i<f.size();){size_t j=i+1;while(j<f.size()&&f[j]==f[i])j++;if(i)s<<" * ";s<<f[i];if(j-i>1)s<<"^"<<(j-i);i=j;}return s.str();}
+
+void print_cuda(){int count=0;if(cudaGetDeviceCount(&count)!=cudaSuccess||count==0){std::cout<<"CUDA device unavailable.\n";return;}cudaDeviceProp p{};CUDA_CHECK(cudaGetDeviceProperties(&p,0));std::cout<<"CUDA device: "<<p.name<<"\n";std::cout<<"CUDA 512-bit Pollard-Rho: enabled\n";}
+
+int main(int argc,char**argv){try{print_cuda();if(argc<2){std::cout<<"Usage: factor_boost_512 INTEGER\n";return 0;}cpp_int n(argv[1]);if(n<2){std::cout<<"N must be at least 2.\n";return 0;}std::cout<<"N = "<<n<<"\n";auto start=std::chrono::high_resolution_clock::now();Cuda512Finder finder;auto factors=factor_complete(n,finder);auto end=std::chrono::high_resolution_clock::now();std::cout<<"Prime factors: [";for(size_t i=0;i<factors.size();i++){if(i)std::cout<<", ";std::cout<<factors[i];}std::cout<<"]\n";std::cout<<"Prime factorisation: "<<fmt(factors)<<"\n";std::cout<<"Complete verification: "<<(verify(n,factors)?"true":"false")<<"\n";std::cout<<"Time: "<<std::fixed<<std::setprecision(6)<<std::chrono::duration<double>(end-start).count()<<" s\n";}catch(const std::exception&e){std::cerr<<"Error: "<<e.what()<<"\n";return 1;}return 0;}

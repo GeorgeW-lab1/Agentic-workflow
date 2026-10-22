@@ -1,0 +1,170 @@
+
+"""
+kripke_all_in_one.py
+
+Single-file Kripke-semantic generator framework.
+"""
+
+from dataclasses import dataclass, field
+
+# ---------- Worlds ----------
+
+@dataclass
+class World:
+    id: int
+    context: tuple
+    token: str
+    valuation: dict = field(default_factory=dict)
+
+
+# ---------- Modal Syntax ----------
+
+class Atom:
+    def __init__(self, name):
+        self.name = name
+
+class Diamond:
+    def __init__(self, relation, formula):
+        self.relation = relation
+        self.formula = formula
+
+class Box:
+    def __init__(self, relation, formula):
+        self.relation = relation
+        self.formula = formula
+
+
+# ---------- Kripke Model ----------
+
+class KripkeModel:
+
+    def __init__(self):
+        self.worlds = {}
+        self.relations = {}
+
+    def add_world(self, world):
+        self.worlds[world.id] = world
+
+    def connect(self, relation, src, dst):
+        self.relations.setdefault(relation, {}).setdefault(src, set()).add(dst)
+
+    def successors(self, relation, world_id):
+        return self.relations.get(relation, {}).get(world_id, set())
+
+
+# ---------- Semantics ----------
+
+def satisfies(model, world_id, formula):
+
+    world = model.worlds[world_id]
+
+    if isinstance(formula, Atom):
+        return bool(world.valuation.get(formula.name, False))
+
+    if isinstance(formula, Diamond):
+        return any(
+            satisfies(model, v, formula.formula)
+            for v in model.successors(formula.relation, world_id)
+        )
+
+    if isinstance(formula, Box):
+        succ = model.successors(formula.relation, world_id)
+        return all(
+            satisfies(model, v, formula.formula)
+            for v in succ
+        )
+
+    return False
+
+
+# ---------- Relations ----------
+
+MEMORY = "MEMORY"
+DREAM = "DREAM"
+DESIRE = "DESIRE"
+LATENT = "LATENT"
+BIGRAM = "BIGRAM"
+TRIGRAM = "TRIGRAM"
+
+
+# ---------- Generator ----------
+
+class KripkeGenerator:
+
+    def __init__(self, model):
+        self.model = model
+
+    def reachable(self, world_id, relation):
+        return [
+            self.model.worlds[w]
+            for w in self.model.successors(relation, world_id)
+        ]
+
+    def choose_first(self, world_id, relation):
+        succ = self.reachable(world_id, relation)
+        return succ[0] if succ else None
+
+    def modal_generate(self, start_world, relation, depth=5):
+        path = [start_world]
+        current = start_world
+
+        for _ in range(depth):
+            nxt = self.choose_first(current, relation)
+            if not nxt:
+                break
+            path.append(nxt.id)
+            current = nxt.id
+
+        return path
+
+
+# ---------- Example ----------
+
+def build_demo():
+
+    m = KripkeModel()
+
+    m.add_world(World(
+        0,
+        ("start",),
+        "root",
+        {"memory": True}
+    ))
+
+    m.add_world(World(
+        1,
+        ("ocean",),
+        "ocean",
+        {"dream": True}
+    ))
+
+    m.add_world(World(
+        2,
+        ("ship",),
+        "ship",
+        {"dream": True, "desire": True}
+    ))
+
+    m.connect(DREAM, 0, 1)
+    m.connect(DREAM, 1, 2)
+
+    return m
+
+
+if __name__ == "__main__":
+
+    model = build_demo()
+
+    print("◇DREAM dream ?")
+
+    print(
+        satisfies(
+            model,
+            0,
+            Diamond(DREAM, Atom("dream"))
+        )
+    )
+
+    gen = KripkeGenerator(model)
+
+    print("Path:", gen.modal_generate(0, DREAM))

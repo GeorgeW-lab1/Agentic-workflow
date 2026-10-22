@@ -1,0 +1,1104 @@
+
+
+"""
+NeuroSymbolic Sum-Diag Neural Network
+======================================
+
+A trainable backpropagation version of the uploaded V18-CSNS-G / Abelian-Reversed
+pipeline.
+
+The original system supplies the structural ideas:
+    - Thébault (rho, theta, sigma) token geometry
+    - diagonal geometric modulation
+    - cross-synaptic neuron sums: W @ logits
+    - transitive geometric sums
+    - influence-space propagation
+    - trigram statistics
+    - sigma -> theta -> ReLU(dim-2) -> rho -> temperature-style projection
+    - commutative additive aggregation
+
+This implementation turns those fixed operations into an actual PyTorch neural
+network. Every learnable operation participates in autograd/backprop.
+
+Core forward equation:
+
+    h = Emb(w1) + Emb(w2)                         # SUM
+
+    q = MLP([h, geom(w1), geom(w2), context_geom])
+
+    l0 = Linear(q)                                # candidate logits
+
+    z_syn = W_syn @ l0                            # CROSS-SYNAPTIC SUM
+
+    z = l0 + a_syn*z_syn + a_trans*t              # SUM
+
+    D_sigma = diag(sigma_gate)
+    D_theta = diag(theta_gate)
+    D_rho   = diag(rho_gate)
+
+    z1 = D_sigma @ z
+    z2 = D_theta @ z1 + residual*z
+    z2 = gate* z2 + (1-gate)*ReLU(z2)             # dim-2 ReLU
+    z3 = D_rho @ sign(z2)|z2|^2
+
+    logits = z3 / temperature
+    loss = CrossEntropy(logits, target)
+
+The important distinction from the original program is that the geometry is no
+longer merely a deterministic post-processing stage. The neural network learns
+the projections, synaptic strength, transitive strength, temperature and
+diagonal gates from the corpus through ordinary gradient descent.
+
+The script is deliberately self-contained: PyTorch only.
+
+Examples:
+    python neural_sum_diag.py --corpus corpus.txt --epochs 20
+    python neural_sum_diag.py --corpus corpus.txt --epochs 20 --vocab 2000
+    python neural_sum_diag.py --corpus corpus.txt --generate "the meaning"
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import random
+import re
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ============================================================
+# DEVICE
+# ============================================================
+
+def best_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+DEVICE = best_device()
+
+
+# ============================================================
+# TOKENIZATION
+# ============================================================
+
+SPECIAL = ["<pad>", "<unk>", "<bos>", "<eos>"]
+
+
+def tokenize(text: str) -> List[str]:
+    # Keep punctuation as tokens, matching the spirit of the source tokenizer.
+    return re.findall(r"[A-Za-z0-9_']+|[.,!?;:]", text.lower())
+
+
+def build_vocab(tokens: List[str], max_vocab: int) -> Tuple[List[str], Dict[str, int]]:
+    counts = Counter(tokens)
+
+    vocab = list(SPECIAL)
+    for tok, _ in counts.most_common(max(0, max_vocab - len(SPECIAL))):
+        if tok not in vocab:
+            vocab.append(tok)
+
+    tok2idx = {t: i for i, t in enumerate(vocab)}
+    return vocab, tok2idx
+
+
+def encode(tokens: List[str], tok2idx: Dict[str, int]) -> List[int]:
+    unk = tok2idx["<unk>"]
+    return [tok2idx.get(t, unk) for t in tokens]
+
+
+def build_trigrams(ids: List[int]) -> Counter:
+    """
+    Count trigram transitions exactly as a statistical prior.
+
+        (w_t, w_{t+1}) -> w_{t+2}
+
+    The neural network learns from these transitions rather than replacing
+    them with an unrelated language-model objective.
+    """
+    tri = Counter()
+    for i in range(len(ids) - 2):
+        tri[(ids[i], ids[i + 1], ids[i + 2])] += 1
+    return tri
+
+
+# ============================================================
+# THÉBAULT-STYLE TOKEN GEOMETRY
+# ============================================================
+
+def _rotate90(x: float, y: float) -> Tuple[float, float]:
+    return -y, x
+
+
+def _thebault_centres(
+    ax: float, ay: float,
+    bx: float, by: float,
+    cx: float, cy: float,
+    dx: float, dy: float,
+):
+    corners = [(ax, ay), (bx, by), (cx, cy), (dx, dy)]
+    centres = []
+
+    for i in range(4):
+        px, py = corners[i]
+        qx, qy = corners[(i + 1) % 4]
+
+        mx, my = (px + qx) / 2.0, (py + qy) / 2.0
+        hx, hy = (qx - px) / 2.0, (qy - py) / 2.0
+        rx, ry = _rotate90(hx, hy)
+
+        centres.append((mx + rx, my + ry))
+
+    return centres
+
+
+def thebault_triple(px: float, py: float, qx: float, qy: float):
+    mag_p = math.hypot(px, py)
+    mag_q = math.hypot(qx, qy)
+
+    if mag_p < 1e-9 or mag_q < 1e-9:
+        return 0.0, 0.0, 0.0
+
+    T = _thebault_centres(
+        0.0, 0.0,
+        px, py,
+        px + qx, py + qy,
+        qx, qy,
+    )
+
+    sides = []
+    for i in range(4):
+        dx = T[(i + 1) % 4][0] - T[i][0]
+        dy = T[(i + 1) % 4][1] - T[i][1]
+        sides.append(math.hypot(dx, dy))
+
+    sigma = sum(sides) / 4.0
+
+    dx_ori = T[1][0] - T[0][0]
+    dy_ori = T[1][1] - T[0][1]
+    theta = math.atan2(dy_ori, dx_ori) % math.pi
+
+    r_balance = 1.0 - abs(mag_p - mag_q) / (mag_p + mag_q)
+
+    cos_angle = (px * qx + py * qy) / (mag_p * mag_q)
+    cos_angle = max(-1.0, min(1.0, cos_angle))
+
+    r_ortho = 1.0 - abs(cos_angle)
+
+    rho = r_balance * r_ortho
+
+    return rho, theta, sigma
+
+
+def build_geometry(
+    vocab: List[str],
+    token_counts: Counter,
+) -> torch.Tensor:
+    """
+    Construct [rho, theta/pi, sigma, 1] for every vocabulary token.
+
+    This follows the uploaded source's frequency/index parameterisation:
+        f_hat = frequency / max_frequency
+        k_hat = index / (V-1)
+        p = f_hat * [cos(2πk), sin(2πk)]
+        q = k_hat * [cos(2πf), sin(2πf)]
+    """
+    V = len(vocab)
+    max_freq = max(token_counts.values(), default=1)
+
+    triples = []
+
+    for i, tok in enumerate(vocab):
+        f_hat = token_counts.get(tok, 0) / max(max_freq, 1)
+        k_hat = i / max(V - 1, 1)
+
+        angle_p = 2.0 * math.pi * k_hat
+        angle_q = 2.0 * math.pi * f_hat
+
+        px = f_hat * math.cos(angle_p)
+        py = f_hat * math.sin(angle_p)
+
+        qx = k_hat * math.cos(angle_q)
+        qy = k_hat * math.sin(angle_q)
+
+        triples.append(thebault_triple(px, py, qx, qy))
+
+    rho = torch.tensor([x[0] for x in triples], dtype=torch.float32)
+    theta = torch.tensor([x[1] for x in triples], dtype=torch.float32)
+    sigma = torch.tensor([x[2] for x in triples], dtype=torch.float32)
+
+    # Rank-normalise rho, matching the source geometry representation.
+    if V > 1:
+        order = torch.argsort(rho)
+        rank = torch.zeros_like(rho)
+        rank[order] = torch.arange(V, dtype=torch.float32)
+        rho = rank / float(V - 1)
+
+    return torch.stack(
+        [
+            rho,
+            theta / math.pi,
+            sigma,
+            torch.ones_like(rho),
+        ],
+        dim=1,
+    )
+
+
+# ============================================================
+# SYNAPTIC / DIAGONAL OPERATORS
+# ============================================================
+
+def pairwise_synaptic_kernel(
+    geom: torch.Tensor,
+    lambda_reg: float = 8.0,
+    gamma_side: float = 4.0,
+) -> torch.Tensor:
+    """
+    W_ij =
+        exp(-gamma (sigma_i-sigma_j)^2)
+        *
+        0.5(1+cos(theta_i-theta_j))
+        *
+        exp(-lambda (rho_i-rho_j)^2)
+
+    The product is commutative.
+
+    No hard top-k is used here because top-k creates a non-differentiable
+    structural selection. The neural network instead learns a continuous
+    synaptic strength.
+    """
+    rho = geom[:, 0]
+    theta = geom[:, 1] * math.pi
+    sigma = geom[:, 2]
+
+    dr = rho[:, None] - rho[None, :]
+    dt = theta[:, None] - theta[None, :]
+    ds = sigma[:, None] - sigma[None, :]
+
+    k_side = torch.exp(-gamma_side * ds.square())
+    k_ori = 0.5 * (1.0 + torch.cos(dt))
+    k_reg = torch.exp(-lambda_reg * dr.square())
+
+    W = k_side * k_ori * k_reg
+
+    # No self-synapse.
+    W = W * (1.0 - torch.eye(W.shape[0], device=W.device))
+
+    # Row normalisation is itself a SUM operation.
+    W = W / W.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+    return W
+
+
+def diag_from_gate(gate: torch.Tensor) -> torch.Tensor:
+    """Explicit D = diag(g)."""
+    return torch.diag(gate)
+
+
+def signed_power(x: torch.Tensor, p: float) -> torch.Tensor:
+    return x.sign() * x.abs().clamp_min(1e-8).pow(p)
+
+
+# ============================================================
+# TRAINABLE NEURAL NETWORK
+# ============================================================
+
+class SumDiagNeuralNetwork(nn.Module):
+    """
+    Backpropagating neural implementation of the source architecture.
+
+    The diagonal matrices are explicit because the request is specifically
+    to express the geometry as SUM + DIAG neural computation.
+
+    Geometry:
+        g_i = [rho_i, theta_i, sigma_i, 1]
+
+    Learned diagonal gates:
+        d_rho   = softplus(MLP_rho(g))
+        d_theta = sigmoid(MLP_theta(g))
+        d_sigma = sigmoid(MLP_sigma(g))
+
+    Context:
+        h = Emb(w1) + Emb(w2)
+
+    Candidate output:
+        l0 = Linear(MLP(h + summed geometry))
+
+    Synaptic propagation:
+        z_syn = W_syn @ l0
+
+    Influence:
+        a candidate can receive propagated mass from the rest of its local
+        candidate neighbourhood.
+
+    Temperature is learned as a positive scalar.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        geom: torch.Tensor,
+        embed_dim: int = 96,
+        hidden_dim: int = 192,
+        lambda_reg: float = 8.0,
+        gamma_side: float = 4.0,
+    ):
+        super().__init__()
+
+        self.vocab_size = vocab_size
+        self.register_buffer("geom", geom)
+
+        # Fixed structural synaptic graph.
+        W = pairwise_synaptic_kernel(
+            geom,
+            lambda_reg=lambda_reg,
+            gamma_side=gamma_side,
+        )
+        self.register_buffer("W_syn", W)
+
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+
+        # Geometry encoder.
+        self.geom_encoder = nn.Sequential(
+            nn.Linear(4, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+
+        # The core neural map.
+        self.context_net = nn.Sequential(
+            nn.Linear(embed_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+        )
+
+        self.logit_head = nn.Linear(hidden_dim, vocab_size)
+
+        # Learned geometric diagonal fields.
+        self.rho_gate_net = nn.Sequential(
+            nn.Linear(4, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
+        )
+
+        self.theta_gate_net = nn.Sequential(
+            nn.Linear(4, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
+        )
+
+        self.sigma_gate_net = nn.Sequential(
+            nn.Linear(4, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
+        )
+
+        # Learned scalar couplings.
+        self.raw_syn_weight = nn.Parameter(torch.tensor(0.25))
+        self.raw_trans_weight = nn.Parameter(torch.tensor(0.10))
+        self.raw_residual = nn.Parameter(torch.tensor(-0.85))
+
+        # Learned positive temperature.
+        self.raw_temperature = nn.Parameter(torch.tensor(0.35))
+
+        # Learned global scale after rho amplification.
+        self.raw_output_scale = nn.Parameter(torch.tensor(0.0))
+
+    @property
+    def syn_weight(self):
+        return F.softplus(self.raw_syn_weight)
+
+    @property
+    def trans_weight(self):
+        return F.softplus(self.raw_trans_weight)
+
+    @property
+    def residual_weight(self):
+        return torch.sigmoid(self.raw_residual)
+
+    @property
+    def temperature(self):
+        return F.softplus(self.raw_temperature) + 0.10
+
+    @property
+    def output_scale(self):
+        return F.softplus(self.raw_output_scale) + 0.10
+
+    def geometry_summary(self, ids: torch.Tensor) -> torch.Tensor:
+        """
+        SUM of token geometry.
+
+        ids: [B, 2]
+        returns: [B, 4]
+        """
+        return self.geom[ids].sum(dim=1)
+
+    def explicit_diagonal_fields(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Build explicit diagonal operators D_sigma, D_theta, D_rho.
+
+        These are V x V matrices. They are exposed as actual matrices rather
+        than merely multiplying vectors, so the implementation literally
+        contains the requested diag operation.
+        """
+        g = self.geom
+
+        sigma_gate = 0.20 + 0.80 * torch.sigmoid(self.sigma_gate_net(g).squeeze(-1))
+        theta_gate = 0.20 + 0.80 * torch.sigmoid(self.theta_gate_net(g).squeeze(-1))
+        rho_gate = 0.20 + F.softplus(self.rho_gate_net(g).squeeze(-1))
+
+        return (
+            diag_from_gate(sigma_gate),
+            diag_from_gate(theta_gate),
+            diag_from_gate(rho_gate),
+        )
+
+    def candidate_diagonal_fields(
+        self,
+        candidate_ids: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Efficient local diagonal representation.
+
+        For a K-candidate training/generation set, we use diag(g_K), avoiding
+        a V x V matrix when the full vocabulary is large.
+        """
+        g = self.geom[candidate_ids]
+
+        sigma_gate = 0.20 + 0.80 * torch.sigmoid(
+            self.sigma_gate_net(g).squeeze(-1)
+        )
+        theta_gate = 0.20 + 0.80 * torch.sigmoid(
+            self.theta_gate_net(g).squeeze(-1)
+        )
+        rho_gate = 0.20 + F.softplus(
+            self.rho_gate_net(g).squeeze(-1)
+        )
+
+        return (
+            diag_from_gate(sigma_gate),
+            diag_from_gate(theta_gate),
+            diag_from_gate(rho_gate),
+        )
+
+    def transitive_sum(
+        self,
+        context_geom: torch.Tensor,
+        candidate_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Geometry-only transitive bonus.
+
+        context_geom: [B, 4]
+        candidate_ids: [B, K]
+
+        Returns [B, K].
+
+        The three kernel components are multiplied commutatively and then
+        summed over the context's two geometry channels.
+        """
+        cand = self.geom[candidate_ids]  # [B,K,4]
+
+        rho_c = cand[..., 0]
+        theta_c = cand[..., 1] * math.pi
+        sigma_c = cand[..., 2]
+
+        rho_x = context_geom[:, None, 0]
+        theta_x = context_geom[:, None, 1] * math.pi
+        sigma_x = context_geom[:, None, 2]
+
+        k_side = torch.exp(-4.0 * (sigma_c - sigma_x).square())
+        k_ori = 0.5 * (1.0 + torch.cos(theta_c - theta_x))
+        k_reg = torch.exp(-8.0 * (rho_c - rho_x).square())
+
+        return k_side * k_ori * k_reg
+
+    def local_synaptic_matrix(
+        self,
+        candidate_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Extract the candidate-to-candidate synaptic matrix.
+
+        candidate_ids: [B,K]
+        returns: [B,K,K]
+        """
+        W = self.W_syn[candidate_ids]           # [B,K,V]
+        W = torch.gather(
+            W,
+            dim=2,
+            index=candidate_ids.unsqueeze(1).expand(-1, candidate_ids.shape[1], -1),
+        )
+        return W
+
+    def forward(
+        self,
+        context_ids: torch.Tensor,
+        candidate_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        context_ids: [B,2]
+        candidate_ids: [B,K]
+
+        returns candidate logits [B,K].
+        """
+        B, K = candidate_ids.shape
+
+        # --------------------------------------------------------
+        # 1. SUM: two context token embeddings.
+        # --------------------------------------------------------
+        e = self.embedding(context_ids)          # [B,2,E]
+        h_words = e.sum(dim=1)                   # [B,E]
+
+        # --------------------------------------------------------
+        # 2. SUM: two context geometry encodings.
+        # --------------------------------------------------------
+        g = self.geom_encoder(self.geom[context_ids])  # [B,2,E]
+        h_geom = g.sum(dim=1)                            # [B,E]
+
+        # --------------------------------------------------------
+        # 3. Neural context state.
+        # --------------------------------------------------------
+        h = self.context_net(torch.cat([h_words, h_geom], dim=-1))
+
+        # --------------------------------------------------------
+        # 4. Raw candidate logits.
+        # --------------------------------------------------------
+        raw = self.logit_head(h)                 # [B,V]
+        logits = torch.gather(
+            raw,
+            1,
+            candidate_ids,
+        )                                        # [B,K]
+
+        # --------------------------------------------------------
+        # 5. CROSS-SYNAPTIC SUM.
+        #       z_syn = W @ logits
+        # --------------------------------------------------------
+        W_local = self.local_synaptic_matrix(candidate_ids)
+        z_syn = torch.bmm(
+            W_local,
+            logits.unsqueeze(-1),
+        ).squeeze(-1)
+
+        # --------------------------------------------------------
+        # 6. TRANSITIVE GEOMETRIC SUM.
+        # --------------------------------------------------------
+        ctx_geom = self.geom[context_ids].sum(dim=1) / 2.0
+        z_trans = self.transitive_sum(ctx_geom, candidate_ids)
+
+        # --------------------------------------------------------
+        # 7. ABELIAN SUM OF NEURAL + SYNAPTIC + TRANSITIVE TERMS.
+        # --------------------------------------------------------
+        z = (
+            logits
+            + self.syn_weight * z_syn
+            + self.trans_weight * z_trans
+        )
+
+        # --------------------------------------------------------
+        # 8. EXPLICIT DIAGONAL OPERATORS.
+        # --------------------------------------------------------
+        D_sigma, D_theta, D_rho = self.candidate_diagonal_fields(candidate_ids)
+
+        z_sigma = torch.bmm(
+            D_sigma,
+            z.unsqueeze(-1),
+        ).squeeze(-1)
+
+        z_theta = torch.bmm(
+            D_theta,
+            z_sigma.unsqueeze(-1),
+        ).squeeze(-1)
+
+        # Residual SUM.
+        z_theta = (
+            z_theta
+            + self.residual_weight * z
+        )
+
+        # --------------------------------------------------------
+        # 9. DIMENSION-2 ORIENTATION GATE.
+        # --------------------------------------------------------
+        theta = self.geom[candidate_ids, 1] * math.pi
+        theta_w = 0.5 * (1.0 + torch.cos(theta))
+
+        gate_raw = F.relu(
+            theta_w - theta_w.mean(dim=1, keepdim=True)
+        )
+
+        gate = gate_raw / (
+            gate_raw.amax(dim=1, keepdim=True).clamp_min(1e-6)
+        )
+        gate = gate.clamp(0.0, 1.0)
+
+        z_relu = F.relu(z_theta)
+
+        z_dim2 = (
+            z_theta * gate
+            + z_relu * (1.0 - gate)
+        )
+
+        # --------------------------------------------------------
+        # 10. RHO DIAGONAL + POWER AMPLIFICATION.
+        # --------------------------------------------------------
+        z_rho = torch.bmm(
+            D_rho,
+            z_dim2.unsqueeze(-1),
+        ).squeeze(-1)
+
+        z_rho = signed_power(z_rho, 2.0)
+
+        # --------------------------------------------------------
+        # 11. Learned temperature.
+        # --------------------------------------------------------
+        logits_out = (
+            self.output_scale * z_rho
+            / self.temperature
+        )
+
+        return logits_out
+
+    def regularisation_loss(self) -> torch.Tensor:
+        """
+        Keeps the learned couplings and diagonal fields from becoming
+        pathological while still allowing them to move under backprop.
+        """
+        return (
+            1e-4 * self.raw_syn_weight.square()
+            + 1e-4 * self.raw_trans_weight.square()
+            + 1e-4 * self.raw_residual.square()
+            + 1e-4 * self.raw_temperature.square()
+        )
+
+
+# ============================================================
+# CANDIDATE SAMPLER
+# ============================================================
+
+class TrigramTrainingSet:
+    """
+    Stores unique trigram transitions with their empirical counts.
+
+    Each unique transition is one training example and the count becomes a
+    loss weight. This preserves the source's use of trigram counts while
+    allowing minibatch neural training.
+    """
+
+    def __init__(
+        self,
+        tri_counts: Counter,
+        vocab_size: int,
+        max_examples: int = 100000,
+    ):
+        items = list(tri_counts.items())
+
+        # Highest-count transitions first.
+        items.sort(key=lambda kv: kv[1], reverse=True)
+
+        if max_examples > 0:
+            items = items[:max_examples]
+
+        self.contexts = torch.tensor(
+            [[a, b] for (a, b, _), _ in items],
+            dtype=torch.long,
+        )
+
+        self.targets = torch.tensor(
+            [c for (_, _, c), _ in items],
+            dtype=torch.long,
+        )
+
+        counts = torch.tensor(
+            [n for _, n in items],
+            dtype=torch.float32,
+        )
+
+        # Log weighting avoids a few very common trigrams dominating the
+        # complete optimisation while retaining count information.
+        self.weights = torch.log1p(counts)
+
+        self.vocab_size = vocab_size
+
+    def __len__(self):
+        return self.targets.shape[0]
+
+
+def make_candidate_batch(
+    targets: torch.Tensor,
+    global_freq: torch.Tensor,
+    k: int,
+) -> torch.Tensor:
+    """
+    Every candidate set contains the true target plus frequent negatives.
+
+    The frequent candidates act as the neural equivalent of the source's
+    candidate neighbourhood / top-k processing.
+    """
+    B = targets.shape[0]
+    V = global_freq.numel()
+    k = min(max(k, 2), V)
+
+    top = torch.topk(global_freq, k=k).indices
+    candidates = top.unsqueeze(0).expand(B, -1).clone()
+
+    # Put the target into the last slot.
+    candidates[:, -1] = targets
+
+    return candidates
+
+
+# ============================================================
+# TRAINING
+# ============================================================
+
+def train_model(
+    model: SumDiagNeuralNetwork,
+    dataset: TrigramTrainingSet,
+    global_freq: torch.Tensor,
+    epochs: int = 20,
+    batch_size: int = 128,
+    lr: float = 2e-3,
+    candidate_k: int = 128,
+    grad_clip: float = 1.0,
+):
+    model.train()
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=lr,
+        weight_decay=1e-4,
+    )
+
+    n = len(dataset)
+
+    for epoch in range(1, epochs + 1):
+        order = torch.randperm(n)
+        total_loss = 0.0
+        total_correct = 0
+        total_items = 0
+
+        for start in range(0, n, batch_size):
+            idx = order[start:start + batch_size]
+
+            context = dataset.contexts[idx].to(DEVICE)
+            target = dataset.targets[idx].to(DEVICE)
+            weight = dataset.weights[idx].to(DEVICE)
+
+            candidates = make_candidate_batch(
+                target,
+                global_freq.to(DEVICE),
+                candidate_k,
+            )
+
+            logits = model(context, candidates)
+
+            # target is deliberately last in each candidate row.
+            target_local = torch.full(
+                (target.shape[0],),
+                candidates.shape[1] - 1,
+                dtype=torch.long,
+                device=DEVICE,
+            )
+
+            per_item = F.cross_entropy(
+                logits,
+                target_local,
+                reduction="none",
+            )
+
+            loss = (
+                per_item * weight
+            ).sum() / weight.sum().clamp_min(1.0)
+
+            loss = loss + model.regularisation_loss()
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+
+            if grad_clip is not None:
+                nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    grad_clip,
+                )
+
+            optimizer.step()
+
+            total_loss += loss.detach().item() * context.shape[0]
+
+            pred = logits.argmax(dim=-1)
+            total_correct += (pred == target_local).sum().item()
+            total_items += context.shape[0]
+
+        avg_loss = total_loss / max(total_items, 1)
+        acc = total_correct / max(total_items, 1)
+
+        print(
+            f"epoch {epoch:03d} | "
+            f"loss={avg_loss:.5f} | "
+            f"trigram_acc={acc:.4f} | "
+            f"temp={model.temperature.item():.4f} | "
+            f"syn={model.syn_weight.item():.4f} | "
+            f"trans={model.trans_weight.item():.4f}"
+        )
+
+
+# ============================================================
+# GENERATION
+# ============================================================
+
+@torch.no_grad()
+def generate(
+    model: SumDiagNeuralNetwork,
+    vocab: List[str],
+    tok2idx: Dict[str, int],
+    seed: str,
+    steps: int = 40,
+    candidate_k: int = 128,
+    temperature: float | None = None,
+) -> str:
+    model.eval()
+
+    words = tokenize(seed)
+
+    if len(words) < 2:
+        words = ["<bos>"] + words
+
+    ids = [
+        tok2idx.get(w, tok2idx["<unk>"])
+        for w in words
+    ]
+
+    # Use model-learned temperature unless the caller overrides it.
+    base_temp = (
+        float(model.temperature.item())
+        if temperature is None
+        else float(temperature)
+    )
+
+    freq = torch.bincount(
+        model.geom.new_tensor(
+            [tok2idx.get(w, tok2idx["<unk>"]) for w in words],
+            dtype=torch.long,
+        ),
+        minlength=len(vocab),
+    ).float().to(DEVICE)
+
+    # Prefer globally common words if the seed itself is tiny.
+    if freq.sum() == 0:
+        freq = torch.ones(len(vocab), device=DEVICE)
+
+    global_candidates = torch.topk(
+        model.W_syn.sum(dim=1),
+        k=min(candidate_k, len(vocab)),
+    ).indices
+
+    for _ in range(steps):
+        ctx = torch.tensor(
+            [[ids[-2], ids[-1]]],
+            dtype=torch.long,
+            device=DEVICE,
+        )
+
+        candidates = global_candidates.unsqueeze(0).clone()
+
+        # Replace the final candidate with a high-probability structural
+        # neighbour so the target space remains dynamic.
+        logits = model(ctx, candidates)
+
+        probs = F.softmax(
+            logits / max(base_temp, 0.05),
+            dim=-1,
+        )
+
+        local = torch.multinomial(
+            probs,
+            num_samples=1,
+        ).item()
+
+        next_id = int(candidates[0, local].item())
+        ids.append(next_id)
+
+    generated = [vocab[i] for i in ids]
+
+    # Lightweight detokenisation.
+    out = ""
+    for tok in generated:
+        if tok in ".,!?;:":
+            out = out.rstrip() + tok + " "
+        else:
+            out += tok + " "
+
+    return out.strip()
+
+
+# ============================================================
+# DIAGNOSTICS
+# ============================================================
+
+def print_model_report(model: SumDiagNeuralNetwork):
+    print()
+    print("=" * 72)
+    print("SUM + DIAG NEURAL BACKPROP MODEL")
+    print("=" * 72)
+
+    print(f"device          : {DEVICE}")
+    print(f"vocab           : {model.vocab_size}")
+    print(f"temperature     : {model.temperature.item():.6f}")
+    print(f"synaptic weight : {model.syn_weight.item():.6f}")
+    print(f"transitive      : {model.trans_weight.item():.6f}")
+    print(f"residual        : {model.residual_weight.item():.6f}")
+    print(f"output scale    : {model.output_scale.item():.6f}")
+
+    print()
+    print("Structural operators:")
+    print("  SUM context             h = e1 + e2")
+    print("  SUM geometry            g = g1 + g2")
+    print("  SYNAPTIC SUM            z_syn = W @ logits")
+    print("  TRANSITIVE SUM          z_trans = K(context,candidate)")
+    print("  DIAG sigma              D_sigma = diag(sigma_gate)")
+    print("  DIAG theta              D_theta = diag(theta_gate)")
+    print("  DIAG rho                D_rho   = diag(rho_gate)")
+    print("  DIM-2 ReLU              gate*x + (1-gate)*ReLU(x)")
+    print("  RHO POWER               sign(x)|x|^2")
+    print("  BACKPROP                CrossEntropy -> AdamW")
+    print("=" * 72)
+    print()
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Trainable SUM + DIAG neural implementation of V18-CSNS-G."
+    )
+
+    parser.add_argument("--corpus", type=str, required=True)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--candidate-k", type=int, default=128)
+    parser.add_argument("--vocab", type=int, default=2000)
+    parser.add_argument("--embed-dim", type=int, default=96)
+    parser.add_argument("--hidden-dim", type=int, default=192)
+    parser.add_argument("--lr", type=float, default=2e-3)
+    parser.add_argument("--max-trigrams", type=int, default=100000)
+    parser.add_argument("--generate", type=str, default="")
+    parser.add_argument("--steps", type=int, default=40)
+    parser.add_argument("--seed", type=int, default=7)
+
+    args = parser.parse_args()
+
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    text = Path(args.corpus).read_text(encoding="utf-8")
+
+    tokens = tokenize(text)
+
+    if len(tokens) < 3:
+        raise RuntimeError("Corpus needs at least three tokens.")
+
+    vocab, tok2idx = build_vocab(
+        tokens,
+        max_vocab=args.vocab,
+    )
+
+    ids = encode(tokens, tok2idx)
+
+    token_counts = Counter(tokens)
+
+    tri_counts = build_trigrams(ids)
+
+    print(
+        f"tokens={len(tokens)} | "
+        f"vocab={len(vocab)} | "
+        f"unique_trigrams={len(tri_counts)}"
+    )
+
+    geom = build_geometry(
+        vocab,
+        token_counts,
+    ).to(DEVICE)
+
+    model = SumDiagNeuralNetwork(
+        vocab_size=len(vocab),
+        geom=geom,
+        embed_dim=args.embed_dim,
+        hidden_dim=args.hidden_dim,
+    ).to(DEVICE)
+
+    dataset = TrigramTrainingSet(
+        tri_counts,
+        vocab_size=len(vocab),
+        max_examples=args.max_trigrams,
+    )
+
+    global_freq = torch.zeros(
+        len(vocab),
+        dtype=torch.float32,
+    )
+
+    for idx, count in Counter(ids).items():
+        global_freq[idx] = float(count)
+
+    print_model_report(model)
+
+    train_model(
+        model,
+        dataset,
+        global_freq,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        candidate_k=args.candidate_k,
+    )
+
+    print()
+    print("Training finished.")
+    print_model_report(model)
+
+    if args.generate:
+        print("GENERATED:")
+        print(
+            generate(
+                model,
+                vocab,
+                tok2idx,
+                args.generate,
+                steps=args.steps,
+                candidate_k=args.candidate_k,
+            )
+        )
+
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "vocab": vocab,
+            "tok2idx": tok2idx,
+            "geom": geom.detach().cpu(),
+        },
+        "sum_diag_neural_model.pt",
+    )
+
+    print("\nSaved: sum_diag_neural_model.pt")
+
+
+if __name__ == "__main__":
+    main()

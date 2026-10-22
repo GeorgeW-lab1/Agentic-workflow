@@ -1,0 +1,248 @@
+
+"""
+Invariant Structural Neural Language Model (research prototype)
+
+Requirements:
+    pip install torch nltk
+
+First run may require:
+    import nltk
+    nltk.download("punkt")
+    nltk.download("averaged_perceptron_tagger")
+
+Usage:
+    python invariant_nn.py --corpus corpus.txt --epochs 5
+"""
+
+import argparse
+import random
+from collections import defaultdict
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+import nltk
+from nltk import pos_tag
+from nltk.tokenize import word_tokenize
+
+
+# -----------------------------
+# Data
+# -----------------------------
+
+def read_text(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read().lower()
+
+
+def trigrams(tokens):
+    return [tuple(tokens[i:i+3]) for i in range(len(tokens)-2)]
+
+
+def signature(tri):
+    return tuple(tag for _, tag in pos_tag(list(tri)))
+
+
+class StructuralDataset(Dataset):
+    def __init__(self, text):
+        toks = word_tokenize(text)
+        tris = trigrams(toks)
+
+        self.word2id = {"<pad>": 0, "<unk>": 1}
+        for w in toks:
+            if w not in self.word2id:
+                self.word2id[w] = len(self.word2id)
+
+        self.id2word = {v: k for k, v in self.word2id.items()}
+
+        self.samples = []
+        buckets = defaultdict(list)
+
+        for tri in tris:
+            sig = signature(tri)
+            ids = [self.word2id.get(w, 1) for w in tri]
+            buckets[sig].append(ids)
+
+        sigs = list(buckets.keys())
+
+        for sig in sigs:
+            lst = buckets[sig]
+            if len(lst) < 2:
+                continue
+
+            for i in range(len(lst)-1):
+                anchor = lst[i]
+                positive = lst[i+1]
+
+                neg_sig = random.choice([s for s in sigs if s != sig])
+                negative = random.choice(buckets[neg_sig])
+
+                self.samples.append((anchor, positive, negative))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        a, p, n = self.samples[idx]
+        return (
+            torch.tensor(a),
+            torch.tensor(p),
+            torch.tensor(n),
+        )
+
+
+# -----------------------------
+# Model
+# -----------------------------
+
+class Encoder(nn.Module):
+    def __init__(self, vocab_size, emb=128, hid=256, latent=64):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, emb)
+        self.gru = nn.GRU(emb, hid, batch_first=True)
+        self.proj = nn.Linear(hid, latent)
+
+    def forward(self, x):
+        e = self.embedding(x)
+        _, h = self.gru(e)
+        z = self.proj(h.squeeze(0))
+        return F.normalize(z, dim=-1)
+
+
+class TransitionNet(nn.Module):
+    def __init__(self, latent=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent, 256),
+            nn.GELU(),
+            nn.Linear(256, latent)
+        )
+
+    def forward(self, z):
+        return self.net(z)
+
+
+class StructuralModel(nn.Module):
+    def __init__(self, vocab_size, latent=64):
+        super().__init__()
+        self.encoder = Encoder(vocab_size, latent=latent)
+        self.transition = TransitionNet(latent)
+
+    def encode(self, x):
+        return self.encoder(x)
+
+
+# -----------------------------
+# Loss
+# -----------------------------
+
+def contrastive(anchor, positive, negative, margin=0.5):
+    pos = 1 - F.cosine_similarity(anchor, positive)
+    neg = 1 - F.cosine_similarity(anchor, negative)
+    return torch.relu(pos - neg + margin).mean()
+
+
+# -----------------------------
+# Training
+# -----------------------------
+
+def train(model, loader, epochs=5, lr=1e-3):
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+
+    for epoch in range(epochs):
+        total = 0.0
+
+        for a, p, n in loader:
+            za = model.encode(a)
+            zp = model.encode(p)
+            zn = model.encode(n)
+
+            pred = model.transition(za)
+            loss1 = contrastive(za, zp, zn)
+            loss2 = F.mse_loss(pred, zp)
+
+            loss = loss1 + 0.5 * loss2
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            total += loss.item()
+
+        print(f"epoch={epoch+1} loss={total/len(loader):.4f}")
+
+
+# -----------------------------
+# Generation
+# -----------------------------
+
+def nearest(seed_tri, dataset, model):
+    ids = [dataset.word2id.get(w, 1) for w in seed_tri]
+    x = torch.tensor([ids])
+
+    with torch.no_grad():
+        z = model.encode(x)
+        target = model.transition(z)
+
+    best = None
+    best_score = -1e9
+
+    for sample in dataset.samples[:5000]:
+        cand = torch.tensor([sample[0]])
+        with torch.no_grad():
+            cz = model.encode(cand)
+
+        score = F.cosine_similarity(target, cz).item()
+
+        if score > best_score:
+            best_score = score
+            best = sample[0]
+
+    return " ".join(dataset.id2word[i] for i in best)
+
+
+# -----------------------------
+# Main
+# -----------------------------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--corpus", required=True)
+    parser.add_argument("--epochs", type=int, default=5)
+    args = parser.parse_args()
+
+    text = read_text(args.corpus)
+
+    ds = StructuralDataset(text)
+    dl = DataLoader(ds, batch_size=64, shuffle=True)
+
+    model = StructuralModel(len(ds.word2id))
+
+    train(model, dl, epochs=args.epochs)
+
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "vocab": ds.word2id,
+        },
+        "invariant_model.pt"
+    )
+
+    while True:
+        seed = input("\nseed text (3+ words, q=quit): ").strip()
+        if seed.lower() == "q":
+            break
+
+        words = seed.split()
+        if len(words) < 3:
+            print("need at least 3 words")
+            continue
+
+        out = nearest(words[-3:], ds, model)
+        print("next invariant state:", out)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,1869 @@
+from __future__ import annotations
+
+"""
+Tau Model
+=========
+
+Complete text-only trigram language model with one-word-per-sentence
+attention shifting.
+
+Core behavior:
+- unigram, bigram, and trigram counting
+- trigram -> bigram -> unigram backoff
+- lexical context vectors
+- cosine-similarity attention
+- one attention word selected for each generated sentence
+- the selected word becomes the context anchor for the next sentence
+- temperature + top-k sampling
+- corpus lexical search
+- Gradio UI
+- JSON model persistence
+
+The old prompt-wide `paradigm_steps` mechanism has been replaced by a
+sentence-level attention mechanism. Each completed sentence produces exactly
+one attention word. That single word is used as the semantic context anchor
+for the next sentence.
+"""
+
+import argparse
+import json
+import math
+import random
+import re
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+import gradio as gr
+
+try:
+    from datasets import load_dataset, get_dataset_config_names
+    HF_DATASETS_AVAILABLE = True
+except ImportError:
+    load_dataset = None
+    get_dataset_config_names = None
+    HF_DATASETS_AVAILABLE = False
+
+
+MODEL_PATH = "model.json"
+DEFAULT_CORPUS_FILE = "corpus.txt"
+
+MAX_NEW_TOKENS = 800
+TEMPERATURE = 0.8
+TOP_K = 20
+MIN_COUNT = 1
+
+INSTRUCTION_WEIGHT = 1.5
+LEXICAL_WEIGHT = 0.15
+VECTOR_WEIGHT = 0.15
+
+# Number of sentences produced by the sentence-level generator.
+DEFAULT_MAX_SENTENCES = 6
+HF_MAX_ROWS = 50000
+HF_MAX_CHARS = 25_000_000
+HF_PRESETS = {
+    "WikiText-2 Raw": "Salesforce/wikitext",
+    "WikiText-103 Raw": "Salesforce/wikitext",
+    "TinyStories": "roneneldan/TinyStories",
+    "Custom Hugging Face dataset": "",
+}
+HF_PRESET_CONFIGS = {
+    "WikiText-2 Raw": "wikitext-2-raw-v1",
+    "WikiText-103 Raw": "wikitext-103-raw-v1",
+    "TinyStories": None,
+    "Custom Hugging Face dataset": None,
+}
+
+IGNORED_TOKENS = {"<bos>", "<eos>", "<unk>"}
+
+
+# ---------------------------------------------------------------------------
+# Removed-math entropy record
+# ---------------------------------------------------------------------------
+
+_SAMPLE_CONTEXT_VECTOR = np.array(
+    [0.40, 0.25, 0.15, 0.12, 0.05, 0.02, 0.01],
+    dtype=np.float64,
+)
+
+
+def _math_context_dimension_reduction(
+    x: np.ndarray, fraction: float = 0.1
+) -> np.ndarray:
+    v = x.copy()
+    target = max(1, math.ceil(len(v) * fraction))
+    while len(v) > target:
+        i, j = np.argsort(v)[-2:]
+        merged = v[i] + v[j]
+        v = np.append(np.delete(v, [i, j]), merged)
+    out = np.zeros_like(x)
+    out[: len(v)] = v
+    return out
+
+
+def _math_deep_bilinear_activation(
+    x: np.ndarray, layers: int = 32, scale: float = 14.0
+) -> np.ndarray:
+    rng = np.random.default_rng(42)
+    v = x.copy()
+
+    for _ in range(layers):
+        projection = rng.standard_normal((len(v), len(v)))
+        projection /= (
+            np.linalg.norm(projection, axis=0, keepdims=True) + 1e-12
+        )
+        u = v @ projection
+        v = np.tanh(scale * u * u)
+
+        if not np.any(v):
+            break
+
+    return v
+
+
+def _math_influence_and_isomorphism(
+    x: np.ndarray, influence_tau: float = 0.7
+) -> np.ndarray:
+    spread = x.max() - x.min() + 1e-12
+    similarity = (
+        1.0 - np.abs(np.subtract.outer(x, x)) / spread
+    )
+    np.fill_diagonal(similarity, -1.0)
+    influence = np.where(similarity >= influence_tau, similarity, 0.0)
+    return influence.sum(axis=1)
+
+
+def _math_transitivity_mask(
+    x: np.ndarray, weight: float = 0.71, k: float = 13.0
+) -> np.ndarray:
+    return weight * (np.exp(k * x) - 1.0)
+
+
+def _math_instruction_compound_growth(
+    x: np.ndarray,
+    curve_k: float = 2.0,
+    midpoint: float = 0.5,
+    growth: float = 0.65,
+    cap: float = 4.0,
+) -> np.ndarray:
+    out = x.copy()
+    factor = 1.0
+
+    for i in range(len(out)):
+        likeness = 1.0 / (
+            1.0 + math.exp(-curve_k * (out[i] - midpoint))
+        )
+        factor = min(cap, factor * (1.0 + growth * likeness))
+        out[i] = out[i] * factor
+
+    return out
+
+
+def _shannon_entropy_bits(v: np.ndarray) -> float:
+    magnitudes = np.abs(v)
+    total = magnitudes.sum()
+
+    if total <= 0:
+        return 0.0
+
+    probabilities = magnitudes[magnitudes > 0] / total
+    return float(
+        -(probabilities * np.log2(probabilities)).sum()
+    )
+
+
+def _build_entropy_matrix() -> Dict[str, Dict[str, Any]]:
+    formulas = {
+        "context_dimension_reduction": _math_context_dimension_reduction,
+        "deep_bilinear_activation": _math_deep_bilinear_activation,
+        "influence_and_isomorphism": _math_influence_and_isomorphism,
+        "transitivity_mask": _math_transitivity_mask,
+        "instruction_compound_growth": _math_instruction_compound_growth,
+    }
+
+    matrix: Dict[str, Dict[str, Any]] = {}
+
+    for name, fn in formulas.items():
+        output_row = fn(_SAMPLE_CONTEXT_VECTOR)
+        matrix[name] = {
+            "output_row": [
+                round(float(v), 4) for v in output_row
+            ],
+            "entropy_bits": round(
+                _shannon_entropy_bits(output_row), 4
+            ),
+        }
+
+    return matrix
+
+
+ENTROPY_MATRIX: Dict[str, Dict[str, Any]] = _build_entropy_matrix()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def tokenize(text: str) -> List[str]:
+    return text.lower().split()
+
+
+def split_sentences(text: str) -> List[str]:
+    """
+    Split on ordinary sentence-ending punctuation while retaining useful
+    punctuation inside the generated text.
+    """
+    pieces = re.split(r"(?<=[.!?])\s+|\n+", text)
+
+    return [
+        piece.strip()
+        for piece in pieces
+        if piece.strip()
+    ]
+
+
+def safe_log(value: float, floor: float = 1e-12) -> float:
+    return math.log(max(value, floor))
+
+
+def bag_of_words(tokens: Iterable[str]) -> Counter:
+    return Counter(
+        token for token in tokens
+        if token not in IGNORED_TOKENS
+    )
+
+
+def cosine_similarity(
+    a: Dict[str, float],
+    b: Dict[str, float],
+    eps: float = 1e-12,
+) -> float:
+    if not a or not b:
+        return 0.0
+
+    common = set(a) & set(b)
+
+    if not common:
+        return 0.0
+
+    dot = sum(a[key] * b[key] for key in common)
+
+    norm_a = math.sqrt(
+        sum(value * value for value in a.values())
+    )
+    norm_b = math.sqrt(
+        sum(value * value for value in b.values())
+    )
+
+    if norm_a < eps or norm_b < eps:
+        return 0.0
+
+    return dot / (norm_a * norm_b)
+
+
+def lexical_overlap(
+    a: Iterable[str],
+    b: Iterable[str],
+) -> float:
+    set_a = set(a) - IGNORED_TOKENS
+    set_b = set(b) - IGNORED_TOKENS
+
+    if not set_a or not set_b:
+        return 0.0
+
+    union = len(set_a | set_b)
+
+    return (
+        len(set_a & set_b) / union
+        if union
+        else 0.0
+    )
+
+
+def strip_structural_tokens(tokens: List[str]) -> List[str]:
+    return [
+        token
+        for token in tokens
+        if token not in IGNORED_TOKENS
+    ]
+
+
+def _dense_matrix_from_vectors(
+    vectors: List[Dict[str, float]],
+) -> Tuple[np.ndarray, List[str]]:
+    keys = sorted({
+        key
+        for vector in vectors
+        for key in vector
+    })
+
+    key_index = {
+        key: index
+        for index, key in enumerate(keys)
+    }
+
+    matrix = np.zeros(
+        (len(vectors), len(keys)),
+        dtype=np.float64,
+    )
+
+    for row, vector in enumerate(vectors):
+        for key, weight in vector.items():
+            matrix[row, key_index[key]] = weight
+
+    return matrix, keys
+
+
+def _dominant_eigenvector(
+    matrix: np.ndarray,
+    iterations: int = 100,
+) -> np.ndarray:
+    n = matrix.shape[0]
+
+    if n == 0:
+        return np.zeros(0)
+
+    vector = np.ones(n, dtype=np.float64) / math.sqrt(n)
+
+    for _ in range(iterations):
+        next_vector = matrix @ vector
+        norm = np.linalg.norm(next_vector)
+
+        if norm < 1e-12:
+            return vector
+
+        next_vector = next_vector / norm
+
+        if (
+            np.allclose(
+                next_vector,
+                vector,
+                atol=1e-10,
+            )
+            or np.allclose(
+                next_vector,
+                -vector,
+                atol=1e-10,
+            )
+        ):
+            return next_vector
+
+        vector = next_vector
+
+    return vector
+
+
+def _clean_word(word: str) -> str:
+    """
+    Remove sentence punctuation for attention-word display while preserving
+    ordinary apostrophes and hyphens.
+    """
+    return re.sub(r"^[^\w'-]+|[^\w'-]+$", "", word.lower())
+
+
+# ---------------------------------------------------------------------------
+# Corpus search
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CorpusReference:
+    sentence: str
+    tokens: List[str]
+    vector: Dict[str, float]
+    frequency: int = 1
+
+
+@dataclass
+class Candidate:
+    sentence: str
+    symbolic_overlap: float
+    vector_similarity: float
+    frequency: int
+    score: float
+    rank: int = 0
+
+
+class CorpusSearch:
+    def __init__(
+        self,
+        lexical_weight: float = LEXICAL_WEIGHT,
+        vector_weight: float = VECTOR_WEIGHT,
+    ):
+        self.lexical_weight = lexical_weight
+        self.vector_weight = vector_weight
+        self.references: List[CorpusReference] = []
+
+    def build_index(self, corpus_text: str) -> None:
+        sentences = split_sentences(corpus_text)
+        counts = Counter(
+            sentence.lower()
+            for sentence in sentences
+        )
+
+        self.references = []
+
+        for sentence in sentences:
+            tokens = tokenize(sentence)
+
+            if not tokens:
+                continue
+
+            bow = bag_of_words(tokens)
+
+            self.references.append(
+                CorpusReference(
+                    sentence=sentence,
+                    tokens=tokens,
+                    vector={
+                        token: float(count)
+                        for token, count in bow.items()
+                    },
+                    frequency=counts[sentence.lower()],
+                )
+            )
+
+    def analyze(
+        self,
+        prompt: str,
+        limit: int = 5,
+    ) -> List[Candidate]:
+        prompt_tokens = tokenize(prompt)
+
+        prompt_vector = {
+            token: float(count)
+            for token, count in bag_of_words(
+                prompt_tokens
+            ).items()
+        }
+
+        candidates: List[Candidate] = []
+
+        for reference in self.references:
+            symbolic = lexical_overlap(
+                prompt_tokens,
+                reference.tokens,
+            )
+
+            vector_similarity = cosine_similarity(
+                prompt_vector,
+                reference.vector,
+            )
+
+            score = (
+                self.lexical_weight * symbolic
+                + self.vector_weight * vector_similarity
+            )
+
+            candidates.append(
+                Candidate(
+                    sentence=reference.sentence,
+                    symbolic_overlap=symbolic,
+                    vector_similarity=vector_similarity,
+                    frequency=reference.frequency,
+                    score=score,
+                )
+            )
+
+        candidates.sort(
+            key=lambda candidate: candidate.score,
+            reverse=True,
+        )
+
+        candidates = candidates[:limit]
+
+        for index, candidate in enumerate(
+            candidates,
+            start=1,
+        ):
+            candidate.rank = index
+
+        return candidates
+
+
+# ---------------------------------------------------------------------------
+# N-gram model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class NGramModel:
+    """
+    Trigram-backoff language model with sentence-level attention.
+
+    Attention rule:
+        sentence N -> exactly one attention word -> sentence N+1
+
+    The attention word is selected from the generated sentence using the
+    lexical context vectors. Its vector is then used to bias the opening
+    generation of the next sentence.
+    """
+
+    eos_token: str = "<eos>"
+    unk_token: str = "<unk>"
+    min_count: int = MIN_COUNT
+
+    unigram: Counter = field(default_factory=Counter)
+
+    bigram: Dict[str, Counter] = field(
+        default_factory=lambda: defaultdict(Counter)
+    )
+
+    trigram: Dict[str, Counter] = field(
+        default_factory=lambda: defaultdict(Counter)
+    )
+
+    lexical_vectors: Dict[str, Dict[str, float]] = field(
+        default_factory=dict
+    )
+
+    vocabulary: List[str] = field(default_factory=list)
+
+    finalized: bool = False
+
+    # ---------------- training ----------------
+
+    def ingest_text(self, text: str) -> None:
+        for sentence in split_sentences(text):
+            words = tokenize(sentence)
+
+            if not words:
+                continue
+
+            self._add_sequence(
+                [
+                    "<bos>",
+                    "<bos>",
+                    *words,
+                    self.eos_token,
+                ]
+            )
+
+    def _add_sequence(
+        self,
+        sequence: List[str],
+    ) -> None:
+        if len(sequence) < 3:
+            return
+
+        for token in sequence:
+            self.unigram[token] += 1
+
+        for left, right in zip(
+            sequence,
+            sequence[1:],
+        ):
+            self.bigram[left][right] += 1
+
+        for a, b, c in zip(
+            sequence,
+            sequence[1:],
+            sequence[2:],
+        ):
+            self.trigram[f"{a}\t{b}"][c] += 1
+
+        self.finalized = False
+
+    def finalize(self) -> None:
+        self.vocabulary = sorted(
+            token
+            for token, count in self.unigram.items()
+            if count >= self.min_count
+        )
+
+        if self.unk_token not in self.vocabulary:
+            self.vocabulary.append(self.unk_token)
+
+        # Context vector for a token = normalized distribution of bigram
+        # contexts in which the token appears.
+        token_contexts: Dict[str, Counter] = defaultdict(Counter)
+
+        for context, counts in self.bigram.items():
+            for token, count in counts.items():
+                token_contexts[token][context] += count
+
+        self.lexical_vectors = {}
+
+        for token in self.vocabulary:
+            counts = token_contexts.get(
+                token,
+                Counter(),
+            )
+
+            total = sum(counts.values()) or 1
+
+            self.lexical_vectors[token] = {
+                context: count / total
+                for context, count in counts.items()
+            }
+
+        self.finalized = True
+
+    # ---------------- attention ----------------
+
+    def attention_vector_for_word(
+        self,
+        word: str,
+    ) -> Dict[str, float]:
+        """
+        Return the lexical context vector belonging to one attention word.
+        """
+        clean = _clean_word(word)
+
+        if not clean:
+            return {}
+
+        vector = self.lexical_vectors.get(clean)
+
+        if vector:
+            return dict(vector)
+
+        return {}
+
+    def select_attention_word(
+        self,
+        sentence: str,
+        previous_attention: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Select exactly one attention word from a completed sentence.
+
+        The score combines:
+        - lexical-context strength
+        - similarity to the previous attention word, when available
+        - frequency
+
+        Structural/punctuation-only tokens are excluded.
+        """
+        if not self.finalized:
+            self.finalize()
+
+        words = [
+            _clean_word(word)
+            for word in tokenize(sentence)
+        ]
+
+        words = [
+            word
+            for word in words
+            if (
+                word
+                and word not in IGNORED_TOKENS
+                and word in self.lexical_vectors
+            )
+        ]
+
+        if not words:
+            return None
+
+        previous_vector = (
+            self.attention_vector_for_word(
+                previous_attention
+            )
+            if previous_attention
+            else {}
+        )
+
+        scored: List[Tuple[float, str]] = []
+
+        for word in words:
+            vector = self.lexical_vectors.get(word, {})
+
+            context_strength = sum(vector.values())
+
+            continuity = (
+                cosine_similarity(
+                    previous_vector,
+                    vector,
+                )
+                if previous_vector
+                else 0.0
+            )
+
+            frequency = self.unigram.get(word, 1)
+
+            frequency_term = math.log1p(frequency)
+
+            score = (
+                context_strength
+                + continuity
+                + 0.01 * frequency_term
+            )
+
+            scored.append((score, word))
+
+        # Deterministic tie-breaking keeps the mechanism reproducible.
+        scored.sort(
+            key=lambda item: (-item[0], item[1])
+        )
+
+        return scored[0][1]
+
+    # ---------------- probability model ----------------
+
+    def backoff_distribution(
+        self,
+        previous: str,
+        previous_previous: Optional[str],
+    ) -> Dict[str, float]:
+        if previous_previous is not None:
+            counts = self.trigram.get(
+                f"{previous_previous}\t{previous}"
+            )
+
+            if counts:
+                return self.normalize(counts)
+
+        counts = self.bigram.get(previous)
+
+        if counts:
+            return self.normalize(counts)
+
+        return self.normalize(self.unigram)
+
+    @staticmethod
+    def normalize(
+        counts: Counter,
+    ) -> Dict[str, float]:
+        total = sum(counts.values())
+
+        if not total:
+            return {}
+
+        return {
+            token: count / total
+            for token, count in counts.items()
+        }
+
+    def resolve_context(
+        self,
+        prompt: str,
+    ) -> Tuple[str, Optional[str]]:
+        tokens = tokenize(prompt)
+
+        if not tokens:
+            return "<bos>", None
+
+        previous = tokens[-1]
+
+        previous_previous = (
+            tokens[-2]
+            if len(tokens) >= 2
+            else None
+        )
+
+        return previous, previous_previous
+
+    def score_next_token(
+        self,
+        prompt: str,
+        candidate_limit: int = 64,
+        instruction_vector: Optional[Dict[str, float]] = None,
+        instruction_weight: float = 0.0,
+    ) -> Dict[str, float]:
+        if not self.finalized:
+            self.finalize()
+
+        previous, previous_previous = (
+            self.resolve_context(prompt)
+        )
+
+        base = self.backoff_distribution(
+            previous,
+            previous_previous,
+        )
+
+        if not base:
+            return {}
+
+        candidates = sorted(
+            base,
+            key=base.get,
+            reverse=True,
+        )[:candidate_limit]
+
+        scores: Dict[str, float] = {}
+
+        for token in candidates:
+            score = safe_log(base[token])
+
+            if (
+                instruction_vector
+                and instruction_weight
+            ):
+                likeness = cosine_similarity(
+                    instruction_vector,
+                    self.lexical_vectors.get(
+                        token,
+                        {},
+                    ),
+                )
+
+                score += (
+                    instruction_weight
+                    * likeness
+                )
+
+            scores[token] = score
+
+        return scores
+
+    def probabilities(
+        self,
+        prompt: str,
+        temperature: float,
+        candidate_limit: int,
+        instruction_vector: Optional[Dict[str, float]] = None,
+        instruction_weight: float = 0.0,
+    ) -> Dict[str, float]:
+        scores = self.score_next_token(
+            prompt,
+            candidate_limit,
+            instruction_vector,
+            instruction_weight,
+        )
+
+        if not scores:
+            return {}
+
+        temperature = max(
+            temperature,
+            1e-5,
+        )
+
+        scaled = {
+            token: score / temperature
+            for token, score in scores.items()
+        }
+
+        maximum = max(scaled.values())
+
+        exps = {
+            token: math.exp(score - maximum)
+            for token, score in scaled.items()
+        }
+
+        total = sum(exps.values())
+
+        if not total:
+            return {}
+
+        return {
+            token: value / total
+            for token, value in exps.items()
+        }
+
+    def sample_next(
+        self,
+        prompt: str,
+        temperature: float = TEMPERATURE,
+        top_k: int = TOP_K,
+        instruction_vector: Optional[Dict[str, float]] = None,
+        instruction_weight: float = 0.0,
+    ) -> str:
+        probs = self.probabilities(
+            prompt,
+            temperature,
+            max(top_k, 1),
+            instruction_vector,
+            instruction_weight,
+        )
+
+        if not probs:
+            return self.eos_token
+
+        items = sorted(
+            probs.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:top_k]
+
+        tokens, weights = zip(*items)
+
+        return random.choices(
+            tokens,
+            weights=weights,
+            k=1,
+        )[0]
+
+    # ---------------- sentence generation ----------------
+
+    def generate_sentence(
+        self,
+        prompt: str,
+        max_tokens: int = 80,
+        temperature: float = TEMPERATURE,
+        top_k: int = TOP_K,
+        attention_vector: Optional[Dict[str, float]] = None,
+        attention_weight: float = INSTRUCTION_WEIGHT,
+    ) -> str:
+        """
+        Generate one sentence.
+
+        The supplied attention vector is active for this sentence only.
+        The caller selects a new one-word attention anchor after the sentence
+        is complete.
+        """
+        generated = tokenize(prompt)
+
+        # Ensure the model starts with enough structural context.
+        if not generated:
+            generated = ["<bos>", "<bos>"]
+        elif len(generated) == 1:
+            generated = ["<bos>", generated[0]]
+
+        output_words: List[str] = []
+
+        # Do not allow an immediate <eos> to produce a zero-response
+        # sentence. The first token must be lexical whenever candidates exist.
+        for step_index in range(max_tokens):
+            token = self.sample_next(
+                " ".join(generated),
+                temperature=temperature,
+                top_k=top_k,
+                instruction_vector=attention_vector,
+                instruction_weight=attention_weight,
+            )
+
+            if token == self.eos_token:
+                # EOS is allowed only after at least one real word.
+                if output_words:
+                    break
+
+                # If EOS is the only available continuation, fall back to
+                # the unigram distribution and choose a lexical token.
+                fallback = self.normalize(self.unigram)
+                fallback = {
+                    word: probability
+                    for word, probability in fallback.items()
+                    if word not in IGNORED_TOKENS
+                }
+
+                if not fallback:
+                    break
+
+                items = sorted(
+                    fallback.items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )[:max(top_k, 1)]
+
+                fallback_tokens, fallback_weights = zip(*items)
+                token = random.choices(
+                    fallback_tokens,
+                    weights=fallback_weights,
+                    k=1,
+                )[0]
+
+            if token in IGNORED_TOKENS:
+                continue
+
+            output_words.append(token)
+            generated.append(token)
+
+        if not output_words:
+            # Last-resort lexical fallback so the UI never displays a blank
+            # response when the model contains any vocabulary.
+            lexical = [
+                word
+                for word in self.vocabulary
+                if word not in IGNORED_TOKENS
+                and self.unigram.get(word, 0) > 0
+            ]
+
+            if lexical:
+                output_words = [
+                    max(
+                        lexical,
+                        key=lambda word: self.unigram.get(word, 0),
+                    )
+                ]
+            else:
+                return ""
+
+        sentence = " ".join(output_words).strip()
+
+        if sentence and sentence[-1] not in ".!?":
+            sentence += "."
+
+        return sentence
+
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = MAX_NEW_TOKENS,
+        temperature: float = TEMPERATURE,
+        top_k: int = TOP_K,
+        max_sentences: int = DEFAULT_MAX_SENTENCES,
+        attention_weight: float = INSTRUCTION_WEIGHT,
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """
+        Generate multiple sentences with exactly one attention word per
+        sentence.
+
+        Returns:
+            generated_text,
+            attention_trace
+
+        Attention trace contains one record per generated sentence.
+        """
+        if not self.finalized:
+            self.finalize()
+
+        prompt = prompt.strip()
+
+        if not prompt:
+            prompt = "<bos>"
+
+        # Use the prompt itself as the first context.
+        context = prompt
+
+        # If the prompt contains a known final word, it can seed the first
+        # sentence's attention context. Otherwise the first sentence starts
+        # without an attention anchor.
+        prompt_words = [
+            _clean_word(word)
+            for word in tokenize(prompt)
+        ]
+
+        prompt_words = [
+            word
+            for word in prompt_words
+            if (
+                word
+                and word in self.lexical_vectors
+            )
+        ]
+
+        previous_attention = (
+            prompt_words[-1]
+            if prompt_words
+            else None
+        )
+
+        attention_vector = (
+            self.attention_vector_for_word(
+                previous_attention
+            )
+            if previous_attention
+            else None
+        )
+
+        sentences: List[str] = []
+        attention_trace: List[Dict[str, Any]] = []
+
+        # Keep total token generation bounded.
+        token_budget = max(
+            1,
+            int(max_new_tokens),
+        )
+
+        sentence_count = max(1, int(max_sentences))
+
+        # Give every sentence a useful minimum budget while still respecting
+        # the requested overall token ceiling as closely as possible.
+        average_sentence_budget = max(
+            8,
+            token_budget // sentence_count,
+        )
+
+        for sentence_index in range(
+            max(1, int(max_sentences))
+        ):
+            sentence = self.generate_sentence(
+                context,
+                max_tokens=average_sentence_budget,
+                temperature=temperature,
+                top_k=top_k,
+                attention_vector=attention_vector,
+                attention_weight=attention_weight,
+            )
+
+            if not sentence:
+                break
+
+            sentences.append(sentence)
+
+            # Exactly ONE attention word is selected here.
+            attention_word = self.select_attention_word(
+                sentence,
+                previous_attention=previous_attention,
+            )
+
+            attention_trace.append(
+                {
+                    "sentence": sentence_index + 1,
+                    "attention": attention_word or "",
+                    "text": sentence,
+                }
+            )
+
+            if not attention_word:
+                break
+
+            # The one selected word becomes the next sentence's context
+            # anchor. Nothing else from the previous sentence is promoted
+            # to the attention state.
+            previous_attention = attention_word
+            attention_vector = (
+                self.attention_vector_for_word(
+                    attention_word
+                )
+            )
+
+            # Keep the attention state to exactly ONE word, but give the
+            # trigram model a structural BOS prefix so an attention shift cannot
+            # collapse generation into an immediate EOS.
+            context = f"<bos> {attention_word}"
+
+        generated_text = " ".join(sentences).strip()
+
+        return generated_text, attention_trace
+
+    # ---------------- persistence ----------------
+
+    def to_dict(self) -> dict:
+        return {
+            "eos_token": self.eos_token,
+            "unk_token": self.unk_token,
+            "min_count": self.min_count,
+            "unigram": dict(self.unigram),
+            "bigram": {
+                key: dict(value)
+                for key, value in self.bigram.items()
+            },
+            "trigram": {
+                key: dict(value)
+                for key, value in self.trigram.items()
+            },
+            "lexical_vectors": self.lexical_vectors,
+            "vocabulary": self.vocabulary,
+            "finalized": self.finalized,
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: dict,
+    ) -> "NGramModel":
+        model = cls(
+            eos_token=data.get(
+                "eos_token",
+                "<eos>",
+            ),
+            unk_token=data.get(
+                "unk_token",
+                "<unk>",
+            ),
+            min_count=data.get(
+                "min_count",
+                MIN_COUNT,
+            ),
+        )
+
+        model.unigram = Counter(
+            data.get("unigram", {})
+        )
+
+        model.bigram = defaultdict(
+            Counter,
+            {
+                key: Counter(value)
+                for key, value in data.get(
+                    "bigram",
+                    {},
+                ).items()
+            },
+        )
+
+        model.trigram = defaultdict(
+            Counter,
+            {
+                key: Counter(value)
+                for key, value in data.get(
+                    "trigram",
+                    {},
+                ).items()
+            },
+        )
+
+        model.lexical_vectors = data.get(
+            "lexical_vectors",
+            {},
+        )
+
+        model.vocabulary = data.get(
+            "vocabulary",
+            [],
+        )
+
+        model.finalized = data.get(
+            "finalized",
+            False,
+        )
+
+        return model
+
+    def save_json(
+        self,
+        path: str | Path,
+    ) -> None:
+        Path(path).write_text(
+            json.dumps(
+                self.to_dict(),
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    @classmethod
+    def load_json(
+        cls,
+        path: str | Path,
+    ) -> "NGramModel":
+        return cls.from_dict(
+            json.loads(
+                Path(path).read_text(
+                    encoding="utf-8"
+                )
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
+# Globals and UI wiring
+# ---------------------------------------------------------------------------
+
+TEXT_MODEL: Optional[NGramModel] = None
+CORPUS_SEARCH: Optional[CorpusSearch] = None
+CORPUS_TEXT_CACHE: Optional[str] = None
+
+
+def load_text_model() -> NGramModel:
+    model_path = Path(MODEL_PATH)
+
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"{MODEL_PATH} not found. "
+            "Upload a corpus and click 'Train model' first."
+        )
+
+    model = NGramModel.load_json(model_path)
+
+    if not model.finalized:
+        model.finalize()
+
+    return model
+
+
+def load_corpus_search(
+    corpus_text: str,
+) -> CorpusSearch:
+    search = CorpusSearch()
+    search.build_index(corpus_text)
+    return search
+
+
+def reload_globals() -> None:
+    global TEXT_MODEL
+    global CORPUS_SEARCH
+    global CORPUS_TEXT_CACHE
+
+    TEXT_MODEL = load_text_model()
+
+    if CORPUS_TEXT_CACHE:
+        corpus_text = CORPUS_TEXT_CACHE
+    else:
+        default_path = Path(
+            DEFAULT_CORPUS_FILE
+        )
+
+        if default_path.exists():
+            corpus_text = default_path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+        else:
+            corpus_text = ""
+
+        CORPUS_TEXT_CACHE = corpus_text
+
+    CORPUS_SEARCH = load_corpus_search(
+        corpus_text
+    )
+
+
+def format_matches(
+    prompt: str,
+    limit: int = 5,
+) -> str:
+    if (
+        CORPUS_SEARCH is None
+        or not CORPUS_SEARCH.references
+    ):
+        return "No corpus file loaded."
+
+    candidates = CORPUS_SEARCH.analyze(
+        prompt,
+        limit=limit,
+    )
+
+    if not candidates:
+        return "No corpus matches found."
+
+    return "\n".join(
+        (
+            f"{candidate.rank}. "
+            f"{candidate.sentence} "
+            f"(score={candidate.score:.3f}, "
+            f"overlap={candidate.symbolic_overlap:.3f}, "
+            f"vector={candidate.vector_similarity:.3f})"
+        )
+        for candidate in candidates
+    )
+
+
+def format_attention_trace(
+    trace: List[Dict[str, Any]],
+) -> str:
+    if not trace:
+        return "No attention shifts."
+
+    rows = []
+
+    for item in trace:
+        rows.append(
+            f"Sentence {item['sentence']}: "
+            f"attention = {item['attention'] or '(none)'}"
+        )
+
+    return "\n".join(rows)
+
+
+
+def _hf_error() -> str:
+    return (
+        "Hugging Face support is not installed. Run: "
+        "pip install datasets"
+    )
+
+
+def _choose_text_column(columns: Iterable[str]) -> Optional[str]:
+    preferred = (
+        "text", "content", "document", "sentence", "prompt", "completion"
+    )
+    cols = list(columns)
+    lower = {str(c).lower(): c for c in cols}
+    for name in preferred:
+        if name in lower:
+            return str(lower[name])
+    for col in cols:
+        if str(col).lower() not in {"id", "label", "labels", "title", "url"}:
+            return str(col)
+    return None
+
+
+def get_hf_configs(dataset_id: str):
+    if not HF_DATASETS_AVAILABLE:
+        return gr.update(choices=[], value=None), _hf_error()
+    dataset_id = (dataset_id or "").strip()
+    if not dataset_id:
+        return gr.update(choices=[], value=None), "Enter a Hugging Face dataset ID first."
+    try:
+        configs = get_dataset_config_names(dataset_id)
+        configs = list(configs) if configs else [None]
+        choices = [c for c in configs if c is not None]
+        return gr.update(choices=choices, value=(choices[0] if choices else None)), \
+            f"Found {len(choices)} configuration(s)."
+    except Exception as exc:
+        return gr.update(choices=[], value=None), f"Could not read configs: {exc}"
+
+
+def _resolve_hf_source(
+    preset: str,
+    custom_dataset_id: str,
+    custom_config: str,
+    split: str,
+) -> Tuple[str, Optional[str], str]:
+    preset = preset or "Custom Hugging Face dataset"
+    if preset == "Custom Hugging Face dataset":
+        dataset_id = (custom_dataset_id or "").strip()
+        config = (custom_config or "").strip() or None
+    else:
+        dataset_id = HF_PRESETS.get(preset, "")
+        config = HF_PRESET_CONFIGS.get(preset)
+    return dataset_id, config, (split or "train").strip() or "train"
+
+
+def train_model_from_huggingface(
+    preset: str,
+    custom_dataset_id: str,
+    custom_config: str,
+    split: str,
+    text_column: str,
+    max_rows: int,
+    max_chars: int,
+    streaming: bool,
+):
+    global CORPUS_TEXT_CACHE
+
+    if not HF_DATASETS_AVAILABLE:
+        return _hf_error(), "", ""
+
+    dataset_id, config, split_name = _resolve_hf_source(
+        preset, custom_dataset_id, custom_config, split
+    )
+    if not dataset_id:
+        return "Enter a Hugging Face dataset ID.", "", ""
+
+    max_rows = max(1, int(max_rows or HF_MAX_ROWS))
+    max_chars = max(1000, int(max_chars or HF_MAX_CHARS))
+
+    try:
+        kwargs = {
+            "path": dataset_id,
+            "split": split_name,
+            "streaming": bool(streaming),
+        }
+        if config:
+            kwargs["name"] = config
+
+        ds = load_dataset(**kwargs)
+        if not hasattr(ds, "column_names"):
+            return "The selected dataset did not expose tabular columns.", "", ""
+
+        columns = list(ds.column_names)
+        selected_column = (text_column or "").strip()
+        if selected_column in {"", "Auto-detect"} or selected_column not in columns:
+            selected_column = _choose_text_column(columns)
+        if selected_column is None:
+            return (
+                f"No usable text column found. Available columns: {columns}",
+                "",
+                "",
+            )
+
+        parts: List[str] = []
+        rows_used = 0
+        chars_used = 0
+        for row in ds:
+            value = row.get(selected_column)
+            if value is None:
+                continue
+            if isinstance(value, (list, tuple)):
+                value = " ".join(str(x) for x in value)
+            elif isinstance(value, dict):
+                value = " ".join(str(x) for x in value.values())
+            else:
+                value = str(value)
+            value = value.strip()
+            if not value:
+                continue
+            remaining = max_chars - chars_used
+            if remaining <= 0:
+                break
+            value = value[:remaining]
+            parts.append(value)
+            chars_used += len(value) + 1
+            rows_used += 1
+            if rows_used >= max_rows or chars_used >= max_chars:
+                break
+
+        corpus_text = "\n".join(parts).strip()
+        if not corpus_text:
+            return "The selected dataset produced no text.", "", ""
+
+        CORPUS_TEXT_CACHE = corpus_text
+        model = NGramModel()
+        model.ingest_text(corpus_text)
+        model.finalize()
+        model.save_json(Path(MODEL_PATH))
+        reload_globals()
+
+        sample_lines = "\n".join(corpus_text.splitlines()[:5])
+        summary = (
+            f"Source: {dataset_id}\n"
+            f"Config: {config or '(default)'}\n"
+            f"Split: {split_name}\n"
+            f"Text column: {selected_column}\n"
+            f"Rows used: {rows_used:,}\n"
+            f"Characters: {len(corpus_text):,}\n"
+            f"Vocabulary: {len(model.vocabulary)}\n"
+            f"Unigrams: {len(model.unigram)}\n"
+            f"Bigram contexts: {len(model.bigram)}\n"
+            f"Trigram contexts: {len(model.trigram)}"
+        )
+        return (
+            f"Hugging Face dataset loaded and model saved to {MODEL_PATH}.",
+            sample_lines,
+            summary,
+        )
+    except Exception as exc:
+        return (
+            f"Hugging Face load/train failed: {type(exc).__name__}: {exc}",
+            "",
+            "",
+        )
+
+
+def train_model_from_file(
+    corpus_file,
+):
+    global CORPUS_TEXT_CACHE
+
+    if corpus_file is None:
+        return (
+            "No corpus file uploaded.",
+            "",
+            "",
+        )
+
+    path = (
+        Path(corpus_file.name)
+        if hasattr(corpus_file, "name")
+        else Path(corpus_file)
+    )
+
+    if not path.exists():
+        return (
+            f"Corpus file not found: {path}",
+            "",
+            "",
+        )
+
+    corpus_text = path.read_text(
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    CORPUS_TEXT_CACHE = corpus_text
+
+    model = NGramModel()
+    model.ingest_text(corpus_text)
+    model.finalize()
+    model.save_json(
+        Path(MODEL_PATH)
+    )
+
+    reload_globals()
+
+    sample_lines = "\n".join(
+        corpus_text.splitlines()[:5]
+    )
+
+    summary = (
+        f"Vocabulary: {len(model.vocabulary)}\n"
+        f"Unigrams: {len(model.unigram)}\n"
+        f"Bigram contexts: {len(model.bigram)}\n"
+        f"Trigram contexts: {len(model.trigram)}"
+    )
+
+    return (
+        f"Model trained and saved to {MODEL_PATH}.",
+        sample_lines,
+        summary,
+    )
+
+
+def generate_from_prompt(
+    user_prompt: str,
+    max_sentences: int,
+):
+    if (
+        TEXT_MODEL is None
+        or CORPUS_SEARCH is None
+    ):
+        return (
+            "Model not loaded. "
+            "Upload a corpus and click 'Train model' first.",
+            "",
+            "",
+        )
+
+    prompt = (
+        user_prompt.strip()
+        if user_prompt
+        and user_prompt.strip()
+        else "<bos>"
+    )
+
+    generated, attention_trace = (
+        TEXT_MODEL.generate(
+            prompt=prompt,
+            max_new_tokens=MAX_NEW_TOKENS,
+            temperature=TEMPERATURE,
+            top_k=TOP_K,
+            max_sentences=int(
+                max_sentences
+            ),
+            attention_weight=INSTRUCTION_WEIGHT,
+        )
+    )
+
+    corpus_matches = (
+        format_matches(
+            prompt,
+            limit=5,
+        )
+        if prompt != "<bos>"
+        else "No prompt provided for corpus search."
+    )
+
+    attention_output = format_attention_trace(
+        attention_trace
+    )
+
+    return (
+        corpus_matches,
+        generated,
+        attention_output,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gradio UI
+# ---------------------------------------------------------------------------
+
+with gr.Blocks(title="Tau Model") as demo:
+    gr.Markdown(
+        """
+# Tau Model
+
+A text-only trigram model with **one-word-per-sentence attention shifting**.
+
+1. Upload a corpus.
+2. Click **Train model**.
+3. Enter a prompt.
+4. Generate several sentences.
+
+For every generated sentence, the model selects **exactly one attention word**.
+That word becomes the context anchor for the next sentence.
+
+The attention therefore moves as:
+
+`Sentence → ONE WORD → next Sentence → ONE WORD → next Sentence`
+"""
+    )
+
+    gr.Markdown(
+        "## 1. Corpus & Training"
+    )
+
+    with gr.Tabs():
+        with gr.Tab("Local file"):
+            with gr.Row():
+                with gr.Column(scale=1):
+                    corpus_file_input = gr.File(
+                        label="Corpus file",
+                        file_types=["file"],
+                    )
+                    train_button = gr.Button(
+                        "Train local corpus",
+                        variant="primary",
+                    )
+                with gr.Column(scale=2):
+                    local_hint = gr.Markdown(
+                        "Upload a `.txt` or other text-readable file."
+                    )
+
+        with gr.Tab("Hugging Face Datasets"):
+            gr.Markdown(
+                "Select a preset for quick setup, or choose **Custom** and enter any public Hugging Face dataset ID. "
+                "Install `datasets` with `pip install datasets` if needed."
+            )
+            with gr.Row():
+                with gr.Column():
+                    hf_preset = gr.Dropdown(
+                        choices=list(HF_PRESETS.keys()),
+                        value="WikiText-2 Raw",
+                        label="Easy dataset selection",
+                    )
+                    hf_dataset_id = gr.Textbox(
+                        label="Custom dataset ID",
+                        placeholder="e.g. username/my-dataset",
+                        value="",
+                    )
+                    hf_config = gr.Dropdown(
+                        choices=[],
+                        label="Dataset configuration (optional)",
+                        allow_custom_value=True,
+                    )
+                    hf_split = gr.Textbox(
+                        label="Split",
+                        value="train",
+                    )
+                with gr.Column():
+                    hf_text_column = gr.Textbox(
+                        label="Text column (leave blank for auto-detect)",
+                        placeholder="text",
+                    )
+                    hf_max_rows = gr.Number(
+                        label="Maximum rows",
+                        value=HF_MAX_ROWS,
+                        precision=0,
+                    )
+                    hf_max_chars = gr.Number(
+                        label="Maximum characters",
+                        value=HF_MAX_CHARS,
+                        precision=0,
+                    )
+                    hf_streaming = gr.Checkbox(
+                        label="Streaming mode (recommended for large datasets)",
+                        value=True,
+                    )
+            with gr.Row():
+                hf_config_button = gr.Button("Load configurations")
+                hf_train_button = gr.Button(
+                    "Train Hugging Face dataset",
+                    variant="primary",
+                )
+            hf_status = gr.Textbox(
+                label="Hugging Face status",
+                lines=2,
+            )
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            train_status = gr.Textbox(
+                label="Training status",
+                lines=2,
+            )
+        with gr.Column(scale=2):
+            corpus_sample = gr.Textbox(
+                label="Corpus sample (first 5 lines)",
+                lines=5,
+            )
+            model_summary = gr.Textbox(
+                label="Model summary",
+                lines=8,
+            )
+
+    train_button.click(
+        fn=train_model_from_file,
+        inputs=[corpus_file_input],
+        outputs=[train_status, corpus_sample, model_summary],
+    )
+
+    hf_config_button.click(
+        fn=get_hf_configs,
+        inputs=[hf_dataset_id],
+        outputs=[hf_config, hf_status],
+    )
+
+    def _preset_change(preset):
+        return (
+            HF_PRESETS.get(preset, ""),
+            HF_PRESET_CONFIGS.get(preset),
+        )
+
+    hf_preset.change(
+        fn=_preset_change,
+        inputs=[hf_preset],
+        outputs=[hf_dataset_id, hf_config],
+    )
+
+    hf_train_button.click(
+        fn=train_model_from_huggingface,
+        inputs=[
+            hf_preset,
+            hf_dataset_id,
+            hf_config,
+            hf_split,
+            hf_text_column,
+            hf_max_rows,
+            hf_max_chars,
+            hf_streaming,
+        ],
+        outputs=[hf_status, corpus_sample, model_summary],
+    )
+
+    gr.Markdown(
+        "## 2. Text Generation"
+    )
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            user_prompt = gr.Textbox(
+                label="Prompt",
+                lines=3,
+            )
+
+            max_sentences_input = gr.Slider(
+                minimum=1,
+                maximum=20,
+                value=DEFAULT_MAX_SENTENCES,
+                step=1,
+                label="Generated sentences",
+            )
+
+            generate_button = gr.Button(
+                "Generate",
+                variant="primary",
+            )
+
+        with gr.Column(scale=2):
+            corpus_output = gr.Textbox(
+                label="Corpus matches",
+                lines=6,
+            )
+
+            generated_output = gr.Textbox(
+                label="Tau model response",
+                lines=10,
+            )
+
+            attention_output = gr.Textbox(
+                label="One-word attention shifts",
+                lines=8,
+            )
+
+    generate_button.click(
+        fn=generate_from_prompt,
+        inputs=[
+            user_prompt,
+            max_sentences_input,
+        ],
+        outputs=[
+            corpus_output,
+            generated_output,
+            attention_output,
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--share",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--server-name",
+        default="127.0.0.1",
+    )
+
+    parser.add_argument(
+        "--server-port",
+        type=int,
+        default=7860,
+    )
+
+    args = parser.parse_args()
+
+    try:
+        reload_globals()
+    except FileNotFoundError:
+        pass
+
+    demo.launch(
+        server_name=args.server_name,
+        server_port=args.server_port,
+        share=args.share,
+    )

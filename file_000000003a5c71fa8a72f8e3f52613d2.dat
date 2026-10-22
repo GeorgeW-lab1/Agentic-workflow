@@ -1,0 +1,550 @@
+from __future__ import annotations
+
+from collections import defaultdict, Counter
+from pathlib import Path
+import re
+import math
+import re
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+EPS = 1e-12
+
+def build_kernel(vocab):
+    return Kernel(vocab)
+# ============================================================
+# Utility
+# ============================================================
+
+def norm(p: torch.Tensor) -> torch.Tensor:
+    return p / p.sum().clamp_min(EPS)
+
+
+def ent(p: torch.Tensor) -> torch.Tensor:
+    q = p.clamp_min(EPS)
+    return -(q * q.log()).sum()
+
+
+def cos(a: torch.Tensor, b: torch.Tensor) -> float:
+    n = min(len(a), len(b))
+
+    if n == 0:
+        return 0.0
+
+    a = a[:n].double()
+    b = b[:n].double()
+
+    return float(
+        F.cosine_similarity(
+            a.unsqueeze(0),
+            b.unsqueeze(0),
+        ).item()
+    )
+
+
+# ============================================================
+# World Model
+# ============================================================
+
+@dataclass
+class World:
+    p: torch.Tensor
+    chosen: str = ""
+    rho: float = 1.0
+    sig: torch.Tensor = field(
+        default_factory=lambda: torch.zeros(
+            1,
+            dtype=torch.float64,
+        )
+    )
+
+
+@dataclass
+class Sig:
+    chosen: str
+    rho: float
+    desire: float
+    dark: float
+    entropy: float
+    vec: torch.Tensor
+
+    def sim(self, other: "Sig") -> float:
+        return cos(self.vec, other.vec)
+
+
+# ============================================================
+# Desire Layer
+# ============================================================
+
+class Desire(nn.Module):
+    def __init__(
+        self,
+        n: int,
+        strength: float = 0.15,
+    ):
+        super().__init__()
+
+        self.strength = nn.Parameter(
+            torch.tensor(
+                strength,
+                dtype=torch.float64,
+            )
+        )
+
+        self.prior = nn.Parameter(
+            torch.zeros(
+                n,
+                dtype=torch.float64,
+            )
+        )
+
+    def forward(
+        self,
+        p: torch.Tensor,
+    ) -> Tuple[torch.Tensor, float]:
+
+        n = len(p)
+
+        prior = (
+            self.prior[:n]
+            if n <= len(self.prior)
+            else F.pad(
+                self.prior,
+                (0, n - len(self.prior)),
+            )
+        )
+
+        prior = norm(
+            F.softmax(
+                prior.float(),
+                dim=0,
+            ).double()
+        )
+
+        s = float(
+            self.strength.clamp(
+                0.0,
+                0.5,
+            )
+        )
+
+        q = norm(
+            (1.0 - s) * p +
+            s * prior
+        )
+
+        w = float(
+            F.cosine_similarity(
+                p.unsqueeze(0),
+                prior.unsqueeze(0),
+            )
+            .clamp(0.0, 1.0)
+            .item()
+        )
+
+        return q, s * w
+
+
+# ============================================================
+# Dark Layer
+# ============================================================
+
+class Dark(nn.Module):
+    def __init__(
+        self,
+        strength: float = 0.30,
+        tail_q: float = 0.40,
+    ):
+        super().__init__()
+
+        self.strength = nn.Parameter(
+            torch.tensor(
+                strength,
+                dtype=torch.float64,
+            )
+        )
+
+        self.tail_q = nn.Parameter(
+            torch.tensor(
+                tail_q,
+                dtype=torch.float64,
+            )
+        )
+
+    def forward(
+        self,
+        p: torch.Tensor,
+        rho: float,
+    ) -> torch.Tensor:
+
+        if len(p) == 0:
+            return p
+
+        s = float(
+            self.strength.clamp(
+                0.0,
+                1.0,
+            )
+        )
+
+        tq = float(
+            self.tail_q.clamp(
+                0.05,
+                0.95,
+            )
+        )
+
+        sp, idx = torch.sort(
+            p,
+            descending=True,
+        )
+
+        cum = torch.cumsum(
+            sp,
+            dim=0,
+        )
+
+        mask = torch.zeros_like(p)
+
+        mask[idx[cum > tq]] = 1.0
+
+        return norm(
+            p *
+            (
+                1.0 +
+                (1.0 - rho) *
+                s *
+                mask
+            )
+        )
+
+
+# ============================================================
+# Reality Layer
+# ============================================================
+
+class Reality(nn.Module):
+    def __init__(
+        self,
+        ew: float = 0.20,
+    ):
+        super().__init__()
+
+        self.ew = nn.Parameter(
+            torch.tensor(
+                ew,
+                dtype=torch.float64,
+            )
+        )
+
+    def forward(
+        self,
+        locked: int,
+        missing: int,
+        p: torch.Tensor,
+    ) -> float:
+
+        total = locked + missing
+
+        base = (
+            0.0
+            if total == 0
+            else (
+                1.0
+                if missing == 0
+                else locked / total
+            )
+        )
+
+        h = float(ent(p))
+
+        hmax = math.log(
+            max(1, len(p))
+        )
+
+        return float(
+            base *
+            (
+                1.0 -
+                float(
+                    self.ew.clamp(
+                        0.0,
+                        1.0,
+                    )
+                ) *
+                (
+                    h /
+                    max(EPS, hmax)
+                )
+            )
+        )
+
+
+# ============================================================
+# Kernel
+# ============================================================
+
+class Kernel(nn.Module):
+    def __init__(
+        self,
+        vocab: Sequence[str],
+    ):
+        super().__init__()
+
+        self.vocab = list(vocab)
+
+        self.desire = Desire(
+            len(self.vocab)
+        )
+
+        self.dark = Dark()
+        self.reality = Reality()
+
+        self.sigs: List[Sig] = []
+
+    def make_sig(
+        self,
+        chosen,
+        p,
+        rho,
+        dw,
+        dm,
+    ):
+
+        vec = torch.tensor(
+            [
+                float(p.max()),
+                float(ent(p)),
+                rho,
+                dw,
+                dm,
+            ],
+            dtype=torch.float64,
+        )
+
+        return Sig(
+            chosen,
+            rho,
+            dw,
+            dm,
+            float(ent(p)),
+            vec,
+        )
+
+    def step(
+        self,
+        p: torch.Tensor,
+        locked: int = 0,
+        missing: int = 0,
+    ) -> World:
+
+        p = norm(
+            p.double()
+        )
+
+        rho = self.reality(
+            locked,
+            missing,
+            p,
+        )
+
+        p1 = self.dark(
+            p,
+            rho,
+        )
+
+        p2, dw = self.desire(
+            p1
+        )
+
+        idx = int(
+            torch.multinomial(
+                p2,
+                1,
+            ).item()
+        )
+
+        chosen = self.vocab[idx]
+
+        dm = float(
+            (p2 - p1)
+            .clamp_min(0)
+            .sum()
+        )
+
+        sig = self.make_sig(
+            chosen,
+            p2,
+            rho,
+            dw,
+            dm,
+        )
+
+        self.sigs.append(sig)
+
+        return World(
+            p=p2,
+            chosen=chosen,
+            rho=rho,
+            sig=sig.vec,
+        )
+
+    def report(self):
+
+        if not self.sigs:
+            return {"n": 0}
+
+        return {
+            "n": len(self.sigs),
+            "rho_mean": float(
+                np.mean(
+                    [s.rho for s in self.sigs]
+                )
+            ),
+            "entropy_mean": float(
+                np.mean(
+                    [s.entropy for s in self.sigs]
+                )
+            ),
+        }
+
+
+
+def tokenize(text: str):
+    text = text.lower()
+    return re.findall(r"\w+|[^\w\s]", text)
+
+def load_dataset(path: str):
+    text = Path(path).read_text(
+        encoding="utf-8"
+    )
+
+    tokens = tokenize(text)
+
+    vocab = sorted(set(tokens))
+
+    transitions = defaultdict(Counter)
+
+    # (w1,w2,w3) -> next_word
+    for i in range(len(tokens) - 3):
+        trigram = (
+            tokens[i],
+            tokens[i + 1],
+            tokens[i + 2],
+        )
+
+        next_word = tokens[i + 3]
+
+        transitions[trigram][next_word] += 1
+
+    return tokens, vocab, transitions
+
+def next_distribution(
+    context,
+    vocab,
+    transitions,
+):
+    counts = transitions.get(tuple(context))
+
+    if not counts:
+        return torch.ones(
+            len(vocab),
+            dtype=torch.float64,
+        ) / len(vocab)
+
+    vocab_index = {
+        w: i
+        for i, w in enumerate(vocab)
+    }
+
+    p = torch.zeros(
+        len(vocab),
+        dtype=torch.float64,
+    )
+
+    for word, count in counts.items():
+        p[vocab_index[word]] = float(count)
+
+    return norm(p)
+
+def generate_text(
+    kernel,
+    vocab,
+    transitions,
+    seed_words,
+    length=200,
+):
+    words = list(seed_words)
+
+    for i in range(length):
+
+        context = (
+            words[-3],
+            words[-2],
+            words[-1],
+        )
+
+        p = next_distribution(
+            context,
+            vocab,
+            transitions,
+        )
+
+        world = kernel.step(
+            p,
+            locked=i + 1,
+            missing=max(
+                0,
+                length - i,
+            ),
+        )
+
+        words.append(world.chosen)
+
+    return " ".join(words)
+
+def main():
+
+    torch.manual_seed(42)
+
+    tokens, vocab, transitions = load_dataset(
+        "kb.txt"
+    )
+
+    kernel = build_kernel(vocab)
+
+    if len(tokens) < 4:
+        raise ValueError(
+            "Dataset must contain at least 4 tokens."
+        )
+
+    seed_words = [
+        tokens[0],
+        tokens[1],
+        tokens[2],
+    ]
+
+    generated = generate_text(
+        kernel,
+        vocab,
+        transitions,
+        seed_words,
+        length=250,
+    )
+
+    print("\n=== GENERATED TEXT ===\n")
+    print(generated)
+
+    print("\n=== REPORT ===\n")
+    print(kernel.report())
+
+
+if __name__ == "__main__":
+    main()
